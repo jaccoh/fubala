@@ -205,8 +205,13 @@ Guardrails specific to external stories:
 - **Two review gates**: the AI reviewer (`prompts/ai_reviewer.md`) checks the
   spec for completeness/verifiability/consistency and must approve before a
   story reaches `human_review`; an AI rejection requeues the story with the
-  reason fed into the next spec run. Only the human `/approve`
+  reason fed into the next spec run. Only `/approve` at the human gate
   (human_review → done) closes a story, stamping `approved_by`.
+- **`human_review` can also be handled by an external AI agent** acting as
+  lead engineer: approve and reject are API actions (REST, or MCP
+  `approve_story` / `reject_story`), so an agent can read the spec, the
+  verify output and the diff and pass or reject the gate. Its reject reason
+  reaches the next run, and its name is stamped in `approved_by`.
 - **The scheduler lives in the server** (never the UI), so stories run headless
   with no browser open. Parallelism: `FUBALA_MAX_PARALLEL_STORIES` (default 2).
 - **Prompts are data**: `backend/prompts/spec_writer.md` and
@@ -447,35 +452,128 @@ Board cards show a compact `r{n} · t{n}/{max}` badge with the same colour
 states while the story runs.
 fubala/16e894bfbd0349d9a3ea93e1d0d23d09
 
-## Third-party intake (MCP)
+## MCP for AI agents (HTTP)
 
-AI-agent clients (ZCode, Claude Code, …) can file stories and shepherd them
-through the pipeline over MCP. The server speaks stdio and proxies the same
-REST API the web UI uses. Add to the client's MCP settings:
+The server itself speaks MCP over **streamable HTTP at `/mcp`**, on the same
+port as the web UI and the REST API. There is no extra process to run: if the
+UI opens, the MCP endpoint is up. It is stateless, so any number of agents
+can connect at once.
+
+**Connect.** With Claude Code:
+
+```sh
+# same machine (loopback needs no token)
+claude mcp add --transport http fubala http://localhost:8000/mcp
+
+# another machine (use TLS, see Security)
+claude mcp add --transport http fubala https://fubala.example.com/mcp \
+  --header "Authorization: Bearer fubala_..."
+```
+
+Other clients use their HTTP MCP config, for example:
+
+```json
+{
+  "mcpServers": {
+    "fubala": {
+      "type": "http",
+      "url": "https://fubala.example.com/mcp",
+      "headers": { "Authorization": "Bearer fubala_..." }
+    }
+  }
+}
+```
+
+**Auth.** `/mcp` sits behind the same token wall as `/api/v1`. It is off by
+default. Turn it on in Settings → Application → *Require a token for API
+calls*. With it on, loopback clients are always allowed and every other
+client needs the Bearer token. Generate or rotate the token on the same page
+(or `POST /api/v1/auth/token` from loopback). The full token is shown exactly
+once; afterwards only its last four characters are visible.
+
+**What an agent gets.**
+
+- On connect, the server sends its working rules as MCP instructions
+  ([`docs/mcp-instructions.md`](docs/mcp-instructions.md)): read the brief
+  first, file every finding as a story, decisions go into the spec, how the
+  gates and landing work. `get_fubala_instructions` returns them again,
+  optionally with a project's "How we work" section.
+- Every REST capability as a tool. `tools/list` gives the full set with
+  schemas; the main groups are:
+  - **Context:** `get_workspace_brief`, `get_project_brief`,
+    `update_project_brief`, `list_projects`, `list_epics`, `list_models`.
+  - **Stories:** `create_story`, `update_story`, `add_story_note`,
+    `queue_story`, `unqueue_story`, `list_stories`, `get_story` (spec, AI
+    review, verify output, history), `get_story_diff`, `wait_for_story`
+    (blocks until a target status, so agents need not poll).
+  - **Gates:** `approve_story`, `reject_story` (the reason reaches the next
+    run), `respec_story`, `retry_story`, `supersede_story`, `cancel_story`,
+    or the generic `story_action`.
+  - **Landing:** `get_project_train`, `pause_project_train`,
+    `land_train_batch_now`, `force_merge_train_batch`, and their siblings.
+  - **External execution:** `claim_story`, `complete_story`,
+    `release_story`, `attach_story_evidence` for agents that write the code
+    themselves.
+  - **Admin:** projects, epics, providers, models and settings.
+- Gate, train and brief actions take a `by` field naming the agent, so the
+  board shows who did what. Credentials are never readable through tools:
+  a provider key can be set, not read back, and the API token is not a tool.
+
+**Stdio-only clients.** A client that can only launch a command can use the
+deprecated stdio bridge, which forwards everything to `/mcp`:
 
 ```json
 {
   "mcpServers": {
     "fubala": {
       "command": "uv",
-      "args": [
-        "run", "--directory", "/abs/path/to/fubala/backend",
-        "python", "-m", "app.mcp"
-      ]
+      "args": ["run", "--directory", "/abs/path/to/fubala/backend",
+               "python", "-m", "app.mcp"],
+      "env": { "FUBALA_API_URL": "http://localhost:8000/api/v1",
+               "FUBALA_API_TOKEN": "fubala_..." }
     }
   }
 }
 ```
 
-Tools: `list_models`, `list_projects`, `list_epics`, `create_story` (model *or*
-skill tier, epic, dependencies, project), `list_stories`, `get_story` (spec +
-AI review + history), `story_action` (queue / unqueue / approve /
-reject-with-reason) and `wait_for_story` (blocks until the story reaches a
-target status). External agents additionally get `claim_story`,
-`complete_story` and `release_story` (optional `released_by`, recorded in
-the event), and `create_story` accepts an
-`execution="external"` flag. Point it at another instance
-with `FUBALA_API_URL`. Plain REST works too — see the API table.
+Plain REST works too: see the API table.
+
+## Headless Claude Code
+
+Claude Code plugs into Fubala in two independent ways.
+
+**1. As the coder (executor `headless`).** Set a project's executor to
+`headless` (Projects page, or `executor` on the project; a story can override
+it with `execution: "headless"`). The CODE stage then runs the Claude Code CLI
+non-interactively (`claude -p ... --output-format stream-json`) inside the
+story's git worktree, instead of Fubala's built-in agent loop. Spec, verify,
+AI review, the gates and landing stay exactly the same.
+
+- The board shows the session live while it runs; afterwards the redacted
+  transcript is kept per story (`get_headless_transcript` over MCP).
+- The run never blocks on a question: `AskUserQuestion` is disabled and the
+  prompt tells the CLI to decide.
+- Any provider in the registry with an Anthropic-compatible endpoint can drive
+  it (for example Z.ai GLM through its Anthropic URL), not only Anthropic.
+- Bounded by `headless_timeout_seconds` (default 2400). With worker pods
+  enabled (`run_executor`, `FUBALA_WORKER_IMAGE_REPO`, `worker_image`) the run
+  happens in a per-story pod instead of the server's own container.
+
+**2. A Claude Max subscription as a provider (`claude-max`).** Add the
+`claude-max` preset in Providers and paste the token from
+`claude setup-token` (`sk-ant-oat01-...`). That token is not an API key: the
+API refuses it for raw calls. So every phase that uses this provider (spec,
+AI review, chat, and the headless code stage) runs through the `claude` CLI.
+Per phase you choose the model and the `--effort` level in Settings →
+Application (`spec_model`, `review_model`, `spec_effort`, `code_effort`,
+`review_effort`).
+
+The token and any provider key reach the CLI only through its environment,
+never its arguments, and every log line, event, note and transcript is
+redacted with the key as an extra literal.
+
+Requirement: the `claude` CLI on the host that runs Fubala. The Docker image
+installs it for the non-root runtime user.
 
 ## Design principles
 
