@@ -10,6 +10,10 @@ upstream can't support: **multi-provider models** (OpenRouter, Z.ai, Ollama, …
 > live permission prompts, epics & dependencies, and the MCP adapter for AI
 > agents. See the roadmap and the sections below.
 
+![The Fubala story board with demo data: stories move from backlog through spec, AI review, execution and human review to landing and done](docs/images/board.png)
+
+*The story board (demo data).*
+
 **No code was copied from upstream (AGPL-3.0).** Fubala borrows concepts only:
 the spec→worktree→QA pipeline shape, status-driven execution, prompts-as-data.
 The structural mistakes are deliberately designed out — see
