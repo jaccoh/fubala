@@ -98,7 +98,7 @@ DEFAULTS: dict[str, Any] = {
     # trusted verify/test command in a per-run pod (app/pods.py); pod is
     # identical to verify until the coder itself moves into the pod.
     "run_executor": "in_process",
-    # tag of docker.hoeve.nu/fubala/fubala-worker; empty = no pods (in-process)
+    # tag of $FUBALA_WORKER_IMAGE_REPO; empty = no pods (in-process)
     "worker_image": "",
     # most coder runs that may load the backend's own node at once (worker
     # pods placed there plus in-process runs); extra runs requeue and wait

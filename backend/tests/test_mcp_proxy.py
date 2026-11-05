@@ -30,8 +30,8 @@ def test_proxy_holds_no_tool_bodies():
 
 def test_mcp_url_defaults_from_api_url(monkeypatch):
     monkeypatch.delenv("FUBALA_MCP_URL", raising=False)
-    monkeypatch.setenv("FUBALA_API_URL", "https://fubala.hoeve.nu/api/v1")
-    assert proxy.mcp_url() == "https://fubala.hoeve.nu/mcp"
+    monkeypatch.setenv("FUBALA_API_URL", "https://fubala.example.com/api/v1")
+    assert proxy.mcp_url() == "https://fubala.example.com/mcp"
     monkeypatch.setenv("FUBALA_MCP_URL", "http://x/custom")
     assert proxy.mcp_url() == "http://x/custom"
 

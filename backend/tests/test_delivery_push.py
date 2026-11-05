@@ -2660,17 +2660,17 @@ def test_public_pr_url_branches():
     internal = "http://gitea.gitea.svc.cluster.local:3000/acme/app/pulls/7"
     # web_base set, html_url present: re-hosted; port and trailing slash kept
     assert (
-        public_pr_url(internal, web_base="https://git.hoeve.nu", **kw)
-        == "https://git.hoeve.nu/acme/app/pulls/7"
+        public_pr_url(internal, web_base="https://git.example.com", **kw)
+        == "https://git.example.com/acme/app/pulls/7"
     )
     assert (
-        public_pr_url(internal + "?x=1", web_base="https://git.hoeve.nu:8443/", **kw)
-        == "https://git.hoeve.nu:8443/acme/app/pulls/7?x=1"
+        public_pr_url(internal + "?x=1", web_base="https://git.example.com:8443/", **kw)
+        == "https://git.example.com:8443/acme/app/pulls/7?x=1"
     )
     # web_base set, no html_url
     assert (
-        public_pr_url(None, web_base="https://git.hoeve.nu/", **kw)
-        == "https://git.hoeve.nu/acme/app/pulls/7"
+        public_pr_url(None, web_base="https://git.example.com/", **kw)
+        == "https://git.example.com/acme/app/pulls/7"
     )
     # web_base unset: unchanged, or built from api_base
     assert public_pr_url(internal, web_base=None, **kw) == internal
@@ -2728,11 +2728,11 @@ def test_internal_html_url_is_rehosted_on_pr_web_base(tmp_path, monkeypatch):
     final, posts = _approve_with_web_base(
         tmp_path,
         monkeypatch,
-        "https://git.hoeve.nu",
+        "https://git.example.com",
         pr_html_url="http://gitea.gitea.svc.cluster.local:3000/acme/app/pulls/7",
     )
     assert final["status"] == "landing", final
-    assert final["pr_url"] == "https://git.hoeve.nu/acme/app/pulls/7"
+    assert final["pr_url"] == "https://git.example.com/acme/app/pulls/7"
     assert [p["path"] for p in posts] == ["/api/v1/repos/acme/app/pulls"]
 
 
@@ -2746,10 +2746,10 @@ def test_html_url_is_stored_unchanged_without_pr_web_base(tmp_path, monkeypatch)
 
 def test_missing_html_url_is_built_from_pr_web_base(tmp_path, monkeypatch):
     final, _ = _approve_with_web_base(
-        tmp_path, monkeypatch, "https://git.hoeve.nu", pr_html_url=None
+        tmp_path, monkeypatch, "https://git.example.com", pr_html_url=None
     )
     assert final["status"] == "landing", final
-    assert final["pr_url"] == "https://git.hoeve.nu/acme/app/pulls/7"
+    assert final["pr_url"] == "https://git.example.com/acme/app/pulls/7"
 
 
 def test_pr_web_base_round_trips_through_patch(tmp_path, monkeypatch):
@@ -2764,9 +2764,9 @@ def test_pr_web_base_round_trips_through_patch(tmp_path, monkeypatch):
 
         assert listed() is None
         res = client.patch(
-            f"/api/v1/projects/{pid}", json={"pr_web_base": "https://git.hoeve.nu"}
+            f"/api/v1/projects/{pid}", json={"pr_web_base": "https://git.example.com"}
         )
-        assert res.json()["pr_web_base"] == "https://git.hoeve.nu"
-        assert listed() == "https://git.hoeve.nu"
+        assert res.json()["pr_web_base"] == "https://git.example.com"
+        assert listed() == "https://git.example.com"
         res = client.patch(f"/api/v1/projects/{pid}", json={"pr_web_base": ""})
         assert res.json()["pr_web_base"] is None

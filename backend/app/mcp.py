@@ -1,7 +1,7 @@
 """Deprecated stdio MCP proxy. The Fubala server itself speaks MCP over
 streamable HTTP at /mcp (same Bearer auth as /api/v1); prefer:
 
-    claude mcp add --transport http fubala https://fubala.hoeve.nu/mcp \\
+    claude mcp add --transport http fubala https://fubala.example.com/mcp \\
         --header "Authorization: Bearer <token>"
 
 This module stays for one release as a thin stdio-to-HTTP bridge for clients

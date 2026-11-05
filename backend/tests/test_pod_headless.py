@@ -104,6 +104,7 @@ def pod_env(monkeypatch, tmp_path):
     monkeypatch.setenv("POD_NAME", "fubala-0")
     monkeypatch.setenv("POD_UID", "uid-123")
     monkeypatch.setenv("NODE_NAME", "stor01")
+    monkeypatch.setenv("FUBALA_WORKER_IMAGE_REPO", "registry.example.com/fubala/fubala-worker")
     # the per-round CLAUDE_CONFIG_DIR travels in the stdin frame, where the
     # fake cannot remap /work: point it at the fake pod root directly
     monkeypatch.setattr(pods, "CLAUDE_DIR", str(tmp_path / "pod" / ".claude"))

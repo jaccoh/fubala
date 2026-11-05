@@ -13,7 +13,7 @@ keeping and nothing it can use against the cluster.
 ## 2. Components
 
 - **Fubala pod** (backend): creates, execs into and deletes worker pods through the Kubernetes API.
-- **Worker pod**: image `docker.hoeve.nu/fubala/fubala-worker` (section 5). Runs as uid/gid 10003 under
+- **Worker pod**: image `$FUBALA_WORKER_IMAGE_REPO` (for example `registry.example.com/fubala/fubala-worker`) (section 5). Runs as uid/gid 10003 under
   tini. Contains git, node, uv, Python 3.12 and 3.15, libgomp and the claude CLI. No Fubala code.
 - **Gitea**: the only source of truth for project code. Workers reach it for dependency fetches only
   where the story needs it; they never push.
@@ -50,8 +50,8 @@ older than the round timeout.
 - **binfmt.** Each build pod has a privileged `tonistiigi/binfmt --install all` initContainer. It runs
   in the runner namespace, **never in the fubala namespace**. Build pods carry no node name and no
   `kubernetes.io/arch`: binfmt lets any node build either arch. They follow the worker placement
-  rules: a toleration for `hoeve.nu/dev=true:NoSchedule` and a preferred node affinity (weight 100)
-  for `hoeve.nu/dev=true`, so the qemu arm64 build does not always land on stor01. This applies
+  rules: a toleration for `<FUBALA_DEV_NODE_LABEL>=true:NoSchedule` and a preferred node affinity (weight 100)
+  for `<FUBALA_DEV_NODE_LABEL>=true`, so the qemu arm64 build does not always land on stor01. This applies
   to the kaniko, crane and smoke pods. binfmt registration is host-wide and persists on that node.
   The privileged binfmt image and the crane image are pinned by exact version plus digest, never
   by `latest`.

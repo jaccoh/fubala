@@ -44,10 +44,9 @@ from .settings_store import DEFAULTS
 log = logging.getLogger(__name__)
 
 SA_DIR = Path("/var/run/secrets/kubernetes.io/serviceaccount")
-IMAGE_REPO = "docker.hoeve.nu/fubala/fubala-worker"
 MANAGED_LABEL = "app.kubernetes.io/managed-by"
 MANAGED_VALUE = "fubala"
-STORY_LABEL = "fubala.hoeve.nu/story"
+DEFAULT_STORY_LABEL = "fubala.dev/story"
 MANAGED_SELECTOR = f"{MANAGED_LABEL}={MANAGED_VALUE}"
 
 WORKER_UID = 10003
@@ -202,6 +201,21 @@ def in_cluster() -> bool:
     return (SA_DIR / "token").is_file() and (SA_DIR / "namespace").is_file()
 
 
+def worker_image_repo() -> str:
+    """Registry path of the worker image, without tag (env, read per call)."""
+    return os.environ.get("FUBALA_WORKER_IMAGE_REPO", "").strip()
+
+
+def story_label() -> str:
+    """Pod label key that maps a worker pod to its story id."""
+    return os.environ.get("FUBALA_STORY_LABEL", "").strip() or DEFAULT_STORY_LABEL
+
+
+def dev_node_label() -> str:
+    """Node label key of the dev node (empty = no toleration or affinity)."""
+    return os.environ.get("FUBALA_DEV_NODE_LABEL", "").strip()
+
+
 def backend_node() -> str:
     return os.environ.get("NODE_NAME", "")
 
@@ -215,6 +229,8 @@ def preflight(worker_image: str) -> str | None:
         return f"{', '.join(missing)} not set in the backend environment"
     if not (worker_image or "").strip():
         return "worker_image is empty"
+    if not worker_image_repo():
+        return "FUBALA_WORKER_IMAGE_REPO is not set"
     try:
         import kubernetes  # noqa: F401
     except Exception as e:  # noqa: BLE001 - any import failure means "no pods"
@@ -261,7 +277,7 @@ class RealKubeApi:
         return [
             {
                 "name": p.metadata.name,
-                "story": (p.metadata.labels or {}).get(STORY_LABEL),
+                "story": (p.metadata.labels or {}).get(story_label()),
                 "node": p.spec.node_name,
                 "phase": p.status.phase,
             }
@@ -374,34 +390,21 @@ def build_pod_spec(
     cpu_limit: str = DEFAULTS["worker_cpu_limit"],
     memory_request: str = DEFAULTS["worker_memory_request"],
     memory_limit: str = DEFAULTS["worker_memory_limit"],
+    story_label: str = DEFAULT_STORY_LABEL,
+    dev_node_label: str = "",
 ) -> dict[str, Any]:
-    """The worker pod manifest. Pure: no client, no os.environ."""
-    dev = {"key": "hoeve.nu/dev", "operator": "In", "values": ["true"]}
-    return {
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": name,
-            "labels": {MANAGED_LABEL: MANAGED_VALUE, STORY_LABEL: story_id},
-            "ownerReferences": [
-                {
-                    "apiVersion": "v1",
-                    "kind": "Pod",
-                    "name": owner_name,
-                    "uid": owner_uid,
-                    "blockOwnerDeletion": False,
-                    "controller": False,
-                }
-            ],
-        },
-        "spec": {
-            "restartPolicy": "Never",
-            "automountServiceAccountToken": False,
-            "enableServiceLinks": False,
-            "activeDeadlineSeconds": deadline_seconds,
+    """The worker pod manifest. Pure: no client, no os.environ.
+
+    With a dev_node_label the pod tolerates that node's taint and prefers it
+    (the backend node stays allowed); without one there is no scheduling hint.
+    """
+    scheduling: dict[str, Any] = {}
+    if dev_node_label:
+        dev = {"key": dev_node_label, "operator": "In", "values": ["true"]}
+        scheduling = {
             "tolerations": [
                 {
-                    "key": "hoeve.nu/dev",
+                    "key": dev_node_label,
                     "operator": "Equal",
                     "value": "true",
                     "effect": "NoSchedule",
@@ -428,6 +431,30 @@ def build_pod_spec(
                     ],
                 }
             },
+        }
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": name,
+            "labels": {MANAGED_LABEL: MANAGED_VALUE, story_label: story_id},
+            "ownerReferences": [
+                {
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "name": owner_name,
+                    "uid": owner_uid,
+                    "blockOwnerDeletion": False,
+                    "controller": False,
+                }
+            ],
+        },
+        "spec": {
+            "restartPolicy": "Never",
+            "automountServiceAccountToken": False,
+            "enableServiceLinks": False,
+            "activeDeadlineSeconds": deadline_seconds,
+            **scheduling,
             "securityContext": {
                 "runAsNonRoot": True,
                 "runAsUser": WORKER_UID,
@@ -471,7 +498,7 @@ _EXEC_OUTER = (
     'cd "$1" || exit 125; cmd=$2; '
     'mkdir -p "$HOME" /work/.exec; touch ' + HEARTBEAT + "; "
     "exec setsid --wait sh -c "
-    "'echo $$ > \"$0\"; exec timeout --kill-after=10 {t} sh -c \"$1\" </dev/null' "
+    '\'echo $$ > "$0"; exec timeout --kill-after=10 {t} sh -c "$1" </dev/null\' '
     '/work/.exec/{n}.pgid "$cmd"'
 )
 
@@ -480,7 +507,7 @@ _EXEC_OUTER = (
 # pod's HEAD equals the local HEAD and uncommitted work stays uncommitted
 SYNC_SCRIPT = (
     "set -e; mkdir -p /work/.exec; touch " + HEARTBEAT + "; "
-    "read -r n; head -c \"$n\" > /work/.bundle; "
+    'read -r n; head -c "$n" > /work/.bundle; '
     "[ -d " + REPO_DIR + "/.git ] || git init -q " + REPO_DIR + "; "
     "cd " + REPO_DIR + "; "
     'if [ "$n" -gt 0 ]; then '
@@ -510,7 +537,7 @@ HEADLESS_SCRIPT = (
     'set -- "$@" "${v%x}"; i=$((i + 1)); done; unset v; '
     'mkdir -p "$HOME" "$CLAUDE_CONFIG_DIR"; '
     "exec setsid --wait sh -c "
-    "'echo $$ > \"$0\"; t=$1; shift; exec timeout --kill-after=10 \"$t\" \"$@\" </dev/null' "
+    '\'echo $$ > "$0"; t=$1; shift; exec timeout --kill-after=10 "$t" "$@" </dev/null\' '
     '"/work/.exec/$n.pgid" "$t" "$@"'
 )
 
@@ -519,7 +546,7 @@ HEADLESS_SCRIPT = (
 # exec stdout is text, so the binary bundle travels base64-encoded.
 PULL_SCRIPT = (
     "cd " + REPO_DIR + " || exit 125; touch " + HEARTBEAT + "; "
-    "h=$(git rev-parse HEAD) || exit 125; echo \"head $h\"; "
+    'h=$(git rev-parse HEAD) || exit 125; echo "head $h"; '
     '[ "$h" = "$1" ] && exit 0; '
     'git bundle create /work/.pull.bundle "$1..HEAD" >&2 || exit 125; '
     "base64 /work/.pull.bundle > /work/.pull.b64 && "
@@ -535,9 +562,9 @@ TRANSCRIPT_SCRIPT = (
 )
 
 KILL_SCRIPT = (
-    "for f in /work/.exec/*.pgid; do [ -f \"$f\" ] && kill -TERM -- \"-$(cat \"$f\")\" "
+    'for f in /work/.exec/*.pgid; do [ -f "$f" ] && kill -TERM -- "-$(cat "$f")" '
     "2>/dev/null; done; sleep 10; "
-    "for f in /work/.exec/*.pgid; do [ -f \"$f\" ] && kill -KILL -- \"-$(cat \"$f\")\" "
+    'for f in /work/.exec/*.pgid; do [ -f "$f" ] && kill -KILL -- "-$(cat "$f")" '
     "2>/dev/null; done; true"
 )
 
@@ -561,9 +588,7 @@ def parse_reap_output(out: str, literals: tuple[str, ...] = ()) -> list[dict[str
             continue
         comm, argv = parts[2], parts[3].strip()
         command = f"{comm} ({argv})" if argv else f"[{comm}]"
-        entries.append(
-            {"command": headless._redact(command, literals), "pid": pid, "age_s": age}
-        )
+        entries.append({"command": headless._redact(command, literals), "pid": pid, "age_s": age})
     return entries
 
 
@@ -637,7 +662,7 @@ def add_maxprocesses(command: str) -> str:
         if not _XDIST_FLAG_RE.search(seg):
             continue
         stripped = seg.rstrip()
-        parts[i] = f"{stripped} --maxprocesses={MAX_PROCESSES}{seg[len(stripped):]}"
+        parts[i] = f"{stripped} --maxprocesses={MAX_PROCESSES}{seg[len(stripped) :]}"
     return "".join(parts)
 
 
@@ -787,7 +812,9 @@ class PodExecutor:
         body = build_pod_spec(
             name=name,
             story_id=self.story_id,
-            image=f"{IMAGE_REPO}:{image_tag}",
+            image=f"{worker_image_repo()}:{image_tag}",
+            story_label=story_label(),
+            dev_node_label=dev_node_label(),
             owner_name=os.environ.get("POD_NAME", ""),
             owner_uid=os.environ.get("POD_UID", ""),
             node_name=backend_node(),
@@ -999,9 +1026,7 @@ class PodExecutor:
         """`git -C /work/repo ...` in the pod (workspaces.GitFn)."""
         literals = self._headless[1] if self._headless else ()
         try:
-            rc, out, err = self._exec_started(
-                ["git", "-C", REPO_DIR, *args], None, 120.0, literals
-            )
+            rc, out, err = self._exec_started(["git", "-C", REPO_DIR, *args], None, 120.0, literals)
         except ExecTimeout as e:
             raise PodRunLost(f"git {' '.join(args[:2])} timed out: {e}") from None
         if rc != 0 and rc not in ok_codes:
@@ -1113,9 +1138,7 @@ class PodExecutor:
             n = self._exec_n
             config_dir = f"{CLAUDE_DIR}/{n}"
             env = headless.pod_child_env(config, config_dir)
-            frame = headless_frame(
-                config.timeout_seconds, env, headless.child_argv(prompt, config)
-            )
+            frame = headless_frame(config.timeout_seconds, env, headless.child_argv(prompt, config))
             argv = ["sh", "-c", HEADLESS_SCRIPT, "_", REPO_DIR, str(n)]
             stream = headless.StreamReader(literals, headless.safe_relay(on_event))
             lines = _LineBuffer(stream.feed)
@@ -1235,6 +1258,8 @@ def _injected_preflight(settings: dict[str, Any]) -> str | None:
         return f"{', '.join(missing)} not set in the backend environment"
     if not str(settings.get("worker_image") or "").strip():
         return "worker_image is empty"
+    if not worker_image_repo():
+        return "FUBALA_WORKER_IMAGE_REPO is not set"
     return None
 
 

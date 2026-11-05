@@ -20,7 +20,7 @@ lifecycle), then `FUBALA-QUICKSTART.md`.
   built.
 - `frontend/`: Vite and React. `make frontend` runs the dev server on :5173.
 - MCP is served by the backend itself over streamable HTTP at `/mcp`, behind the same Bearer auth
-  as `/api/v1`: `claude mcp add --transport http fubala https://fubala.hoeve.nu/mcp --header
+  as `/api/v1`: `claude mcp add --transport http fubala https://fubala.example.com/mcp --header
   "Authorization: Bearer <token>"`. Every `/api/v1` route has a tool (`app/mcp_tools.py`; a test
   enforces it, only health, ping, `POST /auth/session` and the token rotate/clear routes are excluded: a token
   value never enters an LLM context). The stdio process
@@ -33,7 +33,7 @@ lifecycle), then `FUBALA-QUICKSTART.md`.
 ## Deploy (k3s)
 
 - **Image.** `Dockerfile` (tests run in the build), built by `.gitea/workflows/build.yaml` with
-  the kaniko house pattern, tagged `docker.hoeve.nu/fubala/fubala:<date>-<run>`. It runs on
+  the kaniko house pattern, tagged `<registry>/fubala/fubala:<date>-<run>`. It runs on
   pushes to `main` (paths-filtered) and on `workflow_dispatch`: the land job in `ci.yml`
   dispatches it after its own merges, so every landed story gets an image. The image build skips
   the suite (`--build-arg SKIP_TESTS=1`) when CI verified the same tree (dispatch: `tested_sha`
@@ -76,8 +76,12 @@ lifecycle), then `FUBALA-QUICKSTART.md`.
   Fix direction for all four: a scheduler hard-off or an event-based wait instead of
   sleep-plus-deadline. When a test is fixed, remove it from this list AND drop the rerun flag
   from both ci.yml pytest commands and the Dockerfile test stage.
-- **Manifests.** In `hoeve/homelab2`: `infrastructure/apps/fubala/` plus the ArgoCD app. The
-  ingress `fubala.hoeve.nu` is internal only.
+- **Deployment env** (set per deployment, read at call time): `FUBALA_WORKER_IMAGE_REPO` (worker
+  image repo, no tag; empty = no pods, runs stay in-process), `FUBALA_STORY_LABEL` (default
+  `fubala.dev/story`), `FUBALA_DEV_NODE_LABEL` (empty = no toleration or affinity), and for the
+  entrypoint `GIT_PUBLIC_HOST`, `GIT_INTERNAL_URL`, `GIT_AUTHOR_EMAIL`, `FUBALA_DATA_DIR`.
+- **Manifests.** In the deployment repo (`homelab2`): `infrastructure/apps/fubala/` plus the ArgoCD app. The
+  ingress host is internal only.
 - **The pod's entrypoint** (`docker/entrypoint.sh`):
   - clones `FUBALA_REPOS` into `/data/repos`;
   - points git at the in-cluster Gitea;

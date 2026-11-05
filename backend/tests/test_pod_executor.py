@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import subprocess
@@ -22,6 +23,11 @@ SETTINGS = {
     "verify_timeout": 600.0,
     "verify_fix_rounds": 2,
 }
+
+
+@pytest.fixture(autouse=True)
+def worker_image_repo(monkeypatch):
+    monkeypatch.setenv("FUBALA_WORKER_IMAGE_REPO", "registry.example.com/fubala/fubala-worker")
 
 
 class FakeKube:
@@ -121,6 +127,132 @@ def spec(**kw):
     return pods.build_pod_spec(**{**args, **kw})
 
 
+# Frozen from build_pod_spec before the homelab values became settings.
+FROZEN_HOUSEHOLD_SPEC = {
+    "apiVersion": "v1",
+    "kind": "Pod",
+    "metadata": {
+        "name": "p",
+        "labels": {"app.kubernetes.io/managed-by": "fubala", "fubala.hoeve.nu/story": "abc123"},
+        "ownerReferences": [
+            {
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "name": "fubala-0",
+                "uid": "uid-123",
+                "blockOwnerDeletion": False,
+                "controller": False,
+            }
+        ],
+    },
+    "spec": {
+        "restartPolicy": "Never",
+        "automountServiceAccountToken": False,
+        "enableServiceLinks": False,
+        "activeDeadlineSeconds": 100,
+        "tolerations": [
+            {"key": "hoeve.nu/dev", "operator": "Equal", "value": "true", "effect": "NoSchedule"}
+        ],
+        "affinity": {
+            "nodeAffinity": {
+                "requiredDuringSchedulingIgnoredDuringExecution": {
+                    "nodeSelectorTerms": [
+                        {
+                            "matchExpressions": [
+                                {"key": "hoeve.nu/dev", "operator": "In", "values": ["true"]}
+                            ]
+                        },
+                        {
+                            "matchExpressions": [
+                                {
+                                    "key": "kubernetes.io/hostname",
+                                    "operator": "In",
+                                    "values": ["stor01"],
+                                }
+                            ]
+                        },
+                    ]
+                },
+                "preferredDuringSchedulingIgnoredDuringExecution": [
+                    {
+                        "weight": 100,
+                        "preference": {
+                            "matchExpressions": [
+                                {"key": "hoeve.nu/dev", "operator": "In", "values": ["true"]}
+                            ]
+                        },
+                    }
+                ],
+            }
+        },
+        "securityContext": {
+            "runAsNonRoot": True,
+            "runAsUser": 10003,
+            "runAsGroup": 10003,
+            "fsGroup": 10003,
+            "seccompProfile": {"type": "RuntimeDefault"},
+        },
+        "containers": [
+            {
+                "name": "worker",
+                "image": "img:1",
+                "command": [
+                    "sh",
+                    "-c",
+                    'hb="/work/.heartbeat"; [ -e "$hb" ] || touch '
+                    '"$hb"; while :; do now=$(date +%s); last=$(date '
+                    '-r "$hb" +%s 2>/dev/null || echo 0); [ $((now - '
+                    "last)) -gt 900 ] && exit 0; sleep 30; done",
+                ],
+                "env": [
+                    {"name": "HOME", "value": "/cache/home"},
+                    {"name": "npm_config_cache", "value": "/cache/npm"},
+                    {"name": "UV_CACHE_DIR", "value": "/cache/uv"},
+                    {"name": "UV_PYTHON_PREFERENCE", "value": "only-managed"},
+                    {"name": "PYTEST_XDIST_AUTO_NUM_WORKERS", "value": "4"},
+                ],
+                "resources": {
+                    "requests": {"cpu": "1500m", "memory": "2Gi"},
+                    "limits": {"cpu": "4", "memory": "6Gi"},
+                },
+                "securityContext": {
+                    "allowPrivilegeEscalation": False,
+                    "capabilities": {"drop": ["ALL"]},
+                    "runAsNonRoot": True,
+                    "seccompProfile": {"type": "RuntimeDefault"},
+                },
+                "volumeMounts": [
+                    {"name": "work", "mountPath": "/work"},
+                    {"name": "cache", "mountPath": "/cache"},
+                ],
+            }
+        ],
+        "volumes": [{"name": "work", "emptyDir": {}}, {"name": "cache", "emptyDir": {}}],
+    },
+}
+
+
+def test_household_env_reproduces_the_frozen_spec():
+    # the household values come from the homelab2 deployment env
+    body = spec(story_label="fubala.hoeve.nu/story", dev_node_label="hoeve.nu/dev")
+    assert body == FROZEN_HOUSEHOLD_SPEC
+    assert json.dumps(body) == json.dumps(FROZEN_HOUSEHOLD_SPEC)
+
+
+def test_neutral_defaults_carry_no_household_values(monkeypatch):
+    for var in ("FUBALA_WORKER_IMAGE_REPO", "FUBALA_STORY_LABEL", "FUBALA_DEV_NODE_LABEL"):
+        monkeypatch.delenv(var, raising=False)
+    body = spec(story_label=pods.story_label(), dev_node_label=pods.dev_node_label())
+    assert "hoeve" not in json.dumps(body)
+    assert "tolerations" not in body["spec"] and "affinity" not in body["spec"]
+    assert list(body["metadata"]["labels"]) == [pods.MANAGED_LABEL, "fubala.dev/story"]
+    for v in ("POD_NAME", "POD_UID", "NODE_NAME"):
+        monkeypatch.setenv(v, "x")
+    assert pods._injected_preflight(SETTINGS) == "FUBALA_WORKER_IMAGE_REPO is not set"
+    monkeypatch.setenv("FUBALA_WORKER_IMAGE_REPO", "registry.example.com/w")
+    assert pods._injected_preflight(SETTINGS) is None
+
+
 def test_owner_reference_matches_backend_pod():
     ref = spec()["metadata"]["ownerReferences"][0]
     assert ref == {
@@ -131,7 +263,7 @@ def test_owner_reference_matches_backend_pod():
 
 def test_pod_spec_is_restricted_and_carries_nothing_from_the_backend(monkeypatch):
     monkeypatch.setenv("SECRET_MODEL_KEY", "sk-leak")
-    body = spec()
+    body = spec(dev_node_label="example.com/dev")
     text = repr(body)
     assert "sk-leak" not in text
     s = body["spec"]
@@ -155,15 +287,15 @@ def test_pod_spec_is_restricted_and_carries_nothing_from_the_backend(monkeypatch
     assert len(terms["nodeSelectorTerms"]) == 2
     pref = s["affinity"]["nodeAffinity"]["preferredDuringSchedulingIgnoredDuringExecution"]
     assert pref[0]["weight"] == 100
-    assert s["tolerations"][0]["key"] == "hoeve.nu/dev"
+    assert s["tolerations"][0]["key"] == "example.com/dev"
     labels = body["metadata"]["labels"]
-    assert labels[pods.MANAGED_LABEL] == "fubala" and labels[pods.STORY_LABEL] == "abc123"
+    assert labels[pods.MANAGED_LABEL] == "fubala" and labels["fubala.dev/story"] == "abc123"
 
 
 def test_pod_spec_resources_come_from_the_arguments():
-    c = spec(
-        cpu_request="500m", cpu_limit="2", memory_request="512Mi", memory_limit="3Gi"
-    )["spec"]["containers"][0]
+    c = spec(cpu_request="500m", cpu_limit="2", memory_request="512Mi", memory_limit="3Gi")["spec"][
+        "containers"
+    ][0]
     assert c["resources"] == {
         "requests": {"cpu": "500m", "memory": "512Mi"},
         "limits": {"cpu": "2", "memory": "3Gi"},
@@ -235,9 +367,7 @@ def test_add_maxprocesses_only_on_xdist_pytest_segments():
         "uv run pytest -q -n auto --maxprocesses=4 && npm test"
     )
     assert pods.add_maxprocesses("pytest -q") == "pytest -q"
-    assert pods.add_maxprocesses("pytest -n 2 --maxprocesses=2") == (
-        "pytest -n 2 --maxprocesses=2"
-    )
+    assert pods.add_maxprocesses("pytest -n 2 --maxprocesses=2") == ("pytest -n 2 --maxprocesses=2")
 
 
 # ---- executor behaviour -------------------------------------------------------------
@@ -276,9 +406,7 @@ def test_pod_run_syncs_then_runs_and_maps_cwd(tmp_path):
     kube = FakeKube(node="stor01")
     lines: list[str] = []
     ex = executor(kube, lines)
-    rc, out = _run_verify_command(
-        repo / "sub", "pytest -n auto", 60, str(repo), "abc123", ex
-    )
+    rc, out = _run_verify_command(repo / "sub", "pytest -n auto", 60, str(repo), "abc123", ex)
     assert (rc, out) == (0, "ok\n")
     sync, run, reap = kube.execs
     assert reap[0] == ["sh", "-c", pods.REAP_SCRIPT]
@@ -399,9 +527,7 @@ def test_toolbox_train_ci_does_not_cut_workers_on_a_dev_node(tmp_path, monkeypat
 
     kube = FakeKube(node="dev1")
     ex = executor(kube)
-    box = ToolBox(
-        engine=create_engine("sqlite://"), project_root=str(tmp_path), executor=ex
-    )
+    box = ToolBox(engine=create_engine("sqlite://"), project_root=str(tmp_path), executor=ex)
     cmd, note = box._train_ci_adjust("pytest -n 4")
     assert cmd == "pytest -n 4"
     assert "pod on dev node, workers not cut" in note
@@ -529,6 +655,7 @@ def _swallow(ex):
 
 
 # ---- end-of-run reaping ------------------------------------------------------------
+
 
 def is_run(argv):
     """The exec_argv() of a run (the sync script has the same shape)."""
@@ -752,4 +879,3 @@ def test_reap_script_with_nothing_to_kill_prints_nothing(tmp_path):
     script = pods.reap_script(proc=str(root), kill="/bin/false", grace=0)
     res = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=30)
     assert res.returncode == 0 and res.stdout == ""
-

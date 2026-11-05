@@ -142,8 +142,8 @@ def test_destructive_tools_refuse_empty_by(app_client):
 def test_destructive_call_logs_actor(app_client, caplog):
     story = create_story(app_client)
     with caplog.at_level(logging.INFO, logger="app.mcp_tools"):
-        call(app_client, "delete_story", {"story_id": story["id"], "by": "jhoeve"})
-    assert f"mcp destructive tool=delete_story by=jhoeve target={story['id']}" in caplog.text
+        call(app_client, "delete_story", {"story_id": story["id"], "by": "owner"})
+    assert f"mcp destructive tool=delete_story by=owner target={story['id']}" in caplog.text
 
 
 def test_token_routes_have_no_tools(app_client):

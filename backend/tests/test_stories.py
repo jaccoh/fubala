@@ -252,11 +252,11 @@ def test_approve_completes_and_records_approver(client):
     client.post(f"/api/v1/stories/{story['id']}/queue")
     wait_for_status(client, story["id"], "human_review")
 
-    res = client.post(f"/api/v1/stories/{story['id']}/approve", json={"by": "jhoeve"})
+    res = client.post(f"/api/v1/stories/{story['id']}/approve", json={"by": "owner"})
     assert res.status_code == 200
     body = res.json()
     assert body["status"] == "done"
-    assert body["approved_by"] == "jhoeve"
+    assert body["approved_by"] == "owner"
 
     # done is terminal
     assert client.post(f"/api/v1/stories/{story['id']}/queue").status_code == 409
@@ -269,7 +269,7 @@ def test_reject_feeds_back_into_next_spec_run(client, gateway):
 
     res = client.post(
         f"/api/v1/stories/{story['id']}/reject",
-        json={"reason": "missing error handling", "by": "jhoeve"},
+        json={"reason": "missing error handling", "by": "owner"},
     )
     assert res.json()["status"] == "queued"
 

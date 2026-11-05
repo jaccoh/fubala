@@ -2054,7 +2054,7 @@ def build_mcp_server(app) -> MCPServer:
 def streamable_http_asgi(server: MCPServer):
     """Set up `server`'s stateless streamable-HTTP session manager and return
     it. Stateless: one replica, no session affinity. DNS-rebinding protection
-    is off: Bearer auth is the guard and the ingress Host is fubala.hoeve.nu."""
+    is off: Bearer auth is the guard and the ingress Host is fubala.example.com."""
     server.streamable_http_app(
         stateless_http=True,
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),

@@ -20,6 +20,7 @@ def env(monkeypatch):
     monkeypatch.setenv("POD_NAME", "fubala-0")
     monkeypatch.setenv("POD_UID", "uid-123")
     monkeypatch.setenv("NODE_NAME", "stor01")
+    monkeypatch.setenv("FUBALA_WORKER_IMAGE_REPO", "registry.example.com/fubala/fubala-worker")
     monkeypatch.setattr(pods, "preflight", lambda image: None)
     pods._FALLBACK_HELD.clear()
     pods._WARNED.clear()
