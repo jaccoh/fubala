@@ -148,7 +148,7 @@ function StoryCard({ story, blockedBy }: { story: Story; blockedBy: Story[] }) {
         story.queue_position != null &&
         story.waiting_behind != null && (
           <p className="mt-1.5 text-[10px] text-zinc-600">
-            wacht op slot ({story.waiting_behind} bezet) · positie{" "}
+            waiting for a slot ({story.waiting_behind} busy) · position{" "}
             {story.queue_position}
           </p>
         )}

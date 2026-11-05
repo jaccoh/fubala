@@ -316,7 +316,7 @@ class StoryOut(BaseModel):
         default=None,
         description=(
             "How many internal slots are busy (in_progress/executing/ai_review)"
-            " — the N in 'wacht op slot (N bezet)'"
+            " — the N in 'waiting for a slot (N busy)'"
         ),
     )
 
