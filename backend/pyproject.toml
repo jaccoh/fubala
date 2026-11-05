@@ -1,0 +1,50 @@
+[project]
+name = "fubala-backend"
+version = "0.1.0"
+license = "MIT"
+description = "Fubala backend: multi-provider model gateway, chat, and (later) story engine"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlmodel>=0.0.22",
+    "litellm>=1.70",
+    "pydantic-settings>=2.4",
+    "pyyaml>=6.0",
+    "httpx>=0.27",
+    "mcp>=1.2",
+    # zoneinfo's tz database: the slim runtime image ships no OS tzdata, and
+    # provider usage-limit reset times are stated in the provider's own zone
+    "tzdata>=2024.1",
+    # kubernetes: the only maintained Python client with in-cluster config plus
+    # exec with stdin; imported lazily, only inside app/pods.py (worker pods)
+    "kubernetes>=37.0.1",
+]
+
+[dependency-groups]
+dev = [
+    # pytest-rerunfailures: CI-only stopgap for the four known timing flakes
+    # (see "Known flaky tests" in the repo CLAUDE.md). The runtime story
+    # verify_command does NOT use it — the coder must still see a flaky test.
+    "pytest-rerunfailures>=15",
+    "pytest>=8.3",
+    "httpx>=0.27",
+    "ruff>=0.6",
+    "pytest-xdist>=3.8.0",
+    # pytest-timeout: a hung test must FAIL (traceback in the log), not
+    # swallow the CI job to its timeout. Per-file timeout=300 below is the
+    # safety net; tests/test_merge_train.py sets a tighter 120 s per test.
+    "pytest-timeout>=2.3",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+timeout = 300

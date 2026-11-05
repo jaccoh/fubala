@@ -1,0 +1,14 @@
+**/.venv
+**/node_modules
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/.fubala-worktrees
+**/.fubala-cache
+frontend/dist
+backend/data
+**/*.db
+**/*.db-journal
+**/.env
+.git
+macos

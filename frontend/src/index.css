@@ -1,0 +1,134 @@
+@import "tailwindcss";
+@import "highlight.js/styles/github-dark.css";
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background-color: var(--color-zinc-950);
+  color: var(--color-zinc-100);
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-zinc-700) transparent;
+}
+
+/* ---------- markdown ---------- */
+
+.md {
+  font-size: 15px;
+  line-height: 1.65;
+  color: var(--color-zinc-200);
+  word-break: break-word;
+}
+.md > :first-child {
+  margin-top: 0;
+}
+.md > :last-child {
+  margin-bottom: 0;
+}
+.md p {
+  margin: 0.75rem 0;
+}
+.md h1 {
+  margin: 1.25rem 0 0.75rem;
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--color-zinc-50);
+}
+.md h2 {
+  margin: 1.1rem 0 0.6rem;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--color-zinc-50);
+}
+.md h3 {
+  margin: 1rem 0 0.5rem;
+  font-weight: 600;
+  color: var(--color-zinc-100);
+}
+.md ul {
+  margin: 0.75rem 0;
+  list-style: disc;
+  padding-left: 1.5rem;
+}
+.md ol {
+  margin: 0.75rem 0;
+  list-style: decimal;
+  padding-left: 1.5rem;
+}
+.md li {
+  margin: 0.25rem 0;
+}
+.md a {
+  color: var(--color-sky-400);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.md blockquote {
+  margin: 0.75rem 0;
+  border-left: 2px solid var(--color-zinc-700);
+  padding-left: 1rem;
+  color: var(--color-zinc-400);
+  font-style: italic;
+}
+.md code:not(pre code) {
+  border-radius: 0.25rem;
+  background-color: var(--color-zinc-800);
+  padding: 0.1rem 0.35rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.82em;
+  color: var(--color-emerald-300);
+}
+.md pre {
+  margin: 0.75rem 0;
+  overflow-x: auto;
+  border-radius: 0.5rem;
+  border: 1px solid var(--color-zinc-800);
+  background-color: var(--color-zinc-900);
+  padding: 0.75rem;
+  font-size: 13px;
+  line-height: 1.55;
+}
+.md pre code {
+  background: transparent;
+  padding: 0;
+  font-size: inherit;
+}
+.md table {
+  margin: 0.75rem 0;
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+.md th {
+  border: 1px solid var(--color-zinc-800);
+  background-color: var(--color-zinc-900);
+  padding: 0.35rem 0.75rem;
+  text-align: left;
+}
+.md td {
+  border: 1px solid var(--color-zinc-800);
+  padding: 0.35rem 0.75rem;
+}
+.md hr {
+  margin: 1.25rem 0;
+  border-color: var(--color-zinc-800);
+}
+.md strong {
+  font-weight: 600;
+  color: var(--color-zinc-50);
+}
+
+/* blinking caret appended to the streaming bubble */
+.stream-cursor::after {
+  content: "▍";
+  margin-left: 2px;
+  color: var(--color-zinc-500);
+  animation: pulse 1.2s ease-in-out infinite;
+}

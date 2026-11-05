@@ -1,0 +1,437 @@
+name: ci
+
+# House-runner CI + auto-land (mirrors hoeve/ems .gitea/workflows/test.yaml).
+#
+# test: the story-verify suite in a pod (the house pattern: no docker on the
+#       runner, and JS actions are unproven on the runner image, so the suite
+#       runs in containers exactly like ems's test.yaml does).
+# land: merges a green PR; if the branch is behind main, the job merges main
+#       into the PR branch, reruns the suite on that merge result and pushes
+#       the branch -- no event needed, we tested the actual result. Merges by
+#       the actions token start no workflows, so the land job dispatches
+#       build.yaml (workflow_dispatch) itself after its own merge succeeds;
+#       a coordinator merge of a CI PR triggers build.yaml via the normal
+#       push event.
+#
+# One `test` job so branch protection tracks exactly one status-check name.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: [self-hosted, amd64]
+    timeout-minutes: 40
+    steps:
+      - name: Run tests in a pod
+        env:
+          GIT_TOKEN: ${{ secrets.GITEA_TOKEN }}
+        run: |
+          SHA="${{ github.sha }}"
+          POD="ci-fubala-${{ gitea.run_id }}"
+          SECRET="ci-fubala-netrc-${{ gitea.run_id }}"
+          kubectl create secret generic "${SECRET}" -n gitea \
+            --from-literal=.netrc="machine gitea.gitea.svc.cluster.local login hoeve password ${GIT_TOKEN}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n gitea apply -f - <<YAML
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: ${POD}
+            namespace: gitea
+          spec:
+            nodeSelector:
+              kubernetes.io/hostname: hoeve-stor01
+            restartPolicy: Never
+            initContainers:
+            - name: git-clone
+              image: alpine:3.20
+              command: ["/bin/sh", "-c"]
+              args:
+              - |
+                set -e
+                apk add --no-cache git ca-certificates
+                # On pull_request events github.sha may be the merge ref, not
+                # the branch head: full clone, prefer the sha, fall back to
+                # the branch (same caveat as ems's test.yaml).
+                git clone "http://gitea.gitea.svc.cluster.local:3000/hoeve/fubala.git" /workspace
+                git -C /workspace checkout ${SHA} 2>/dev/null || git -C /workspace checkout "${{ gitea.ref_name }}"
+              volumeMounts:
+              - name: workspace
+                mountPath: /workspace
+              - name: netrc
+                mountPath: /root/.netrc
+                subPath: .netrc
+            # The two suites are regular containers, never initContainers: a
+            # Pod whose only entries are initContainers has no containers at
+            # all, and kubectl apply rejects it (spec.containers: Required
+            # value), so the job can never be green. They start in parallel
+            # once git-clone finished, and each owns a disjoint subtree of the
+            # shared workspace (backend/.venv vs frontend/node_modules + dist),
+            # so side-by-side is safe.
+            containers:
+            # Backend suite: same provisioning as the Dockerfile base/test
+            # stages. only-managed + UV_PYTHON_INSTALL_DIR mirror the image
+            # build (which runs this suite green), so uv can fetch 3.13 on
+            # demand for tests/test_run_tests_tool.py; with only-system it
+            # refuses (run 2979: "A managed Python download is available for
+            # Python 3.13, but the Python preference is set to 'only system'").
+            # uv comes from PyPI (pinned to the Dockerfile's 0.13.1): the
+            # ghcr.io/astral-sh/uv image is distroless and has no /bin/sh.
+            - name: backend
+              image: python:3.12-slim
+              command: ["/bin/sh", "-c"]
+              args:
+              - |
+                set -e
+                apt-get update -qq >/dev/null && apt-get install -y -qq git >/dev/null
+                pip install --no-cache-dir --quiet uv==0.13.1
+                uv --version
+                git config --global user.name test && git config --global user.email test@local
+                export UV_PYTHON_INSTALL_DIR=/opt/uv-python
+                export UV_PYTHON_PREFERENCE=only-managed
+                export UV_LINK_MODE=copy
+                cd /workspace/backend
+                uv python install 3.12
+                uv sync --locked
+                # --reruns: CI-only stopgap for the four known timing flakes
+                # (CLAUDE.md "Known flaky tests"); the story verify_command
+                # must NOT get it — the coder still sees the flake. -rR prints
+                # named "RERUN test..." lines: without it the only trace is
+                # progress dots (RF), which the rerun greps below would miss.
+                uv run pytest -q --reruns 2 --reruns-delay 2 -rR
+              workingDir: /workspace
+              volumeMounts:
+              - name: workspace
+                mountPath: /workspace
+            # Frontend checks in their own container, on the same checkout, in
+            # parallel with the backend: the node image family the Dockerfile
+            # builds the UI with (node:24.21.0-bookworm-slim).
+            - name: frontend
+              image: node:24-slim
+              command: ["/bin/sh", "-c"]
+              args:
+              - |
+                set -e
+                cd /workspace/frontend
+                npm ci --no-audit --no-fund
+                npx tsc -b --noEmit
+                npm run build
+              workingDir: /workspace
+              volumeMounts:
+              - name: workspace
+                mountPath: /workspace
+            volumes:
+            - name: workspace
+              emptyDir: {}
+            - name: netrc
+              secret:
+                secretName: ${SECRET}
+          YAML
+          # Timeout dump: before cleanup, name the failed tests and show the
+          # last progress from every container (incident run 3098: the suite
+          # hung at 83%, failures unnamed, and the pod was left running).
+          # Container names come from the live pod spec, so init containers
+          # are included and nothing is hardcoded. Every kubectl/grep step is
+          # || true-guarded: a Pending pod logs nothing, only headers print.
+          dump_pod_logs() {
+            P="$1"
+            NAMES=$(kubectl get pod "${P}" -n gitea -o jsonpath='{.spec.initContainers[*].name} {.spec.containers[*].name}' 2>/dev/null) || true
+            for C in ${NAMES}; do
+              # One full fetch per container to /tmp: the tail and the grep
+              # below read that copy, so nothing is lost if the pod is
+              # deleted right after the dump. Under `set -e` (the land job)
+              # every kubectl/grep here must stay || true-guarded too.
+              kubectl logs "${P}" -n gitea -c "${C}" > "/tmp/${P}-${C}.log" 2>/dev/null || true
+              echo "=== ${P} / ${C}: last 200 lines ==="
+              tail -n 200 "/tmp/${P}-${C}.log" 2>/dev/null || true
+              echo "=== ${P} / ${C}: FAILED/ERROR/RERUN ==="
+              grep -E 'FAILED|ERROR|RERUN' "/tmp/${P}-${C}.log" 2>/dev/null || echo "no FAILED/ERROR/RERUN lines"
+            done
+          }
+          # Two suites in this pod (backend on uv-managed 3.12, frontend on
+          # node:24), each with its own install: the wait budget covers both
+          # before the job's own timeout-minutes: 40 cuts it off.
+          for i in $(seq 1 420); do
+            PHASE=$(kubectl get pod "${POD}" -n gitea -o jsonpath='{.status.phase}' 2>/dev/null || echo Pending)
+            if [ "$PHASE" = "Succeeded" ]; then
+              # Rerun visibility BEFORE the delete: once the pod is gone the
+              # log is gone. RERUN lines come from pytest-rerunfailures.
+              kubectl logs "${POD}" -n gitea -c backend > /tmp/test-backend.log 2>/dev/null || true
+              echo "=== reruns ==="
+              if grep -E "^RERUN" /tmp/test-backend.log; then
+                grep -E "^RERUN" /tmp/test-backend.log >> "${GITEA_STEP_SUMMARY:-/dev/null}" || true
+              else
+                echo "no reruns"
+                echo "no reruns" >> "${GITEA_STEP_SUMMARY:-/dev/null}" || true
+              fi
+              kubectl delete pod "${POD}" -n gitea --ignore-not-found >/dev/null 2>&1 || true
+              kubectl delete secret "${SECRET}" -n gitea --ignore-not-found >/dev/null 2>&1 || true
+              exit 0
+            fi
+            if [ "$PHASE" = "Failed" ]; then
+              echo "=== init git-clone log ==="
+              kubectl logs "${POD}" -n gitea -c git-clone --tail=30 || true
+              echo "=== backend log ==="
+              kubectl logs "${POD}" -n gitea -c backend --tail=60 || true
+              echo "=== reruns ==="
+              kubectl logs "${POD}" -n gitea -c backend --tail=400 2>/dev/null | grep -E "^RERUN" || echo "no reruns"
+              echo "=== frontend log ==="
+              kubectl logs "${POD}" -n gitea -c frontend --tail=40 || true
+              echo "=== pod events ==="
+              kubectl describe pod "${POD}" -n gitea | tail -15 || true
+              kubectl delete secret "${SECRET}" -n gitea --ignore-not-found >/dev/null 2>&1 || true
+              echo "KEEPING the failed pod ${POD} for inspection (secret cleaned)"
+              exit 1
+            fi
+            sleep 5
+          done
+          dump_pod_logs "${POD}"
+          kubectl delete pod "${POD}" -n gitea --ignore-not-found >/dev/null 2>&1 || true
+          kubectl delete secret "${SECRET}" -n gitea --ignore-not-found >/dev/null 2>&1 || true
+          echo "Timeout waiting for test pod (pod and secret cleaned)"
+          exit 1
+  land:
+    needs: [test]
+    runs-on: [self-hosted, amd64]
+    timeout-minutes: 40
+    # pull_request only (a push to main has no PR to merge) and never on a PR
+    # Gitea has already merged: the land job's own push fires a new
+    # pull_request run, and merged != true keeps that loop closed.
+    if: gitea.event_name == 'pull_request' && gitea.event.pull_request.merged != true
+    steps:
+      - name: Merge main into the PR branch, retest, then merge via the Gitea API
+        env:
+          GIT_TOKEN: ${{ secrets.GITEA_TOKEN }}
+        run: |
+          set -e
+          API="https://git.hoeve.nu/api/v1/repos/hoeve/fubala"
+          AUTH="Authorization: token ${GIT_TOKEN}"
+          PR="${{ gitea.event.pull_request.number }}"
+          BR="${{ gitea.event.pull_request.head.ref }}"  # the source branch (ref_name is the PR ref on PR events)
+          # A PR touching protected CI (workflows) can never merge itself:
+          # green + waiting for coordinator, exactly like ems. The land job
+          # would run the PR's untested copy of this very workflow. It also
+          # dispatches nothing here: a coordinator merge lands on main and
+          # the normal push event starts build.yaml.
+          if curl -sS -H "${AUTH}" "${API}/pulls/${PR}/files?limit=50" \
+               | grep -q '"filename":".gitea/'; then
+            echo "CI PR: tests are green, waiting for coordinator to merge (force-merge)"
+            exit 0
+          fi
+          SECRET="land-fubala-netrc-${{ gitea.run_id }}"
+          kubectl create secret generic "${SECRET}" -n gitea \
+            --from-literal=.netrc="machine gitea.gitea.svc.cluster.local login hoeve password ${GIT_TOKEN}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n gitea apply -f - <<YAML
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: land-fubala-${{ gitea.run_id }}
+            namespace: gitea
+          spec:
+            nodeSelector:
+              kubernetes.io/hostname: hoeve-stor01
+            restartPolicy: Never
+            containers:
+            # The land container merges main into the PR branch, retests the
+            # backend on the merged tree, then -- after the frontend
+            # container below reports green on that same tree -- pushes it.
+            # /workspace keeps its .git: the push after the test needs it.
+            - name: land
+              image: python:3.12-slim
+              command: ["/bin/sh", "-c"]
+              args:
+              - |
+                set -e
+                apt-get update -qq >/dev/null && apt-get install -y -qq git >/dev/null
+                pip install --no-cache-dir --quiet uv==0.13.1
+                uv --version
+                git config --global user.name test && git config --global user.email test@local
+                git clone http://gitea.gitea.svc.cluster.local:3000/hoeve/fubala.git /workspace
+                cd /workspace
+                git checkout "${BR}"
+                git config user.email ci@hoeve.nu && git config user.name "fubala-ci"
+                git merge origin/main -m "merge: main (CI branch update)" || {
+                  echo "MERGE CONFLICT merging main into ${BR}; resolve it by hand"; exit 1; }
+                # Signal the frontend retest container (below): it tests this
+                # same merged tree, so it must not start before the merge
+                # exists. Nothing here is pushed until it is green.
+                touch /verdict/merged
+                # Same commands as the test job (the story-verify suite), on
+                # the merged tree: this retest is the final pre-merge gate.
+                # Same uv provisioning as the test job's backend container
+                # (and the Dockerfile base stage): only-managed Pythons, so
+                # the suite can fetch 3.13 on demand (run 2979).
+                export UV_PYTHON_INSTALL_DIR=/opt/uv-python
+                export UV_PYTHON_PREFERENCE=only-managed
+                export UV_LINK_MODE=copy
+                cd /workspace/backend
+                uv python install 3.12
+                uv sync --locked
+                # Same flags as the test job: the final gate tests what the PR
+                # gate tested (CLAUDE.md "Known flaky tests" for the stopgap).
+                # -rR for the greppable RERUN lines, same as the test job.
+                uv run pytest -q --reruns 2 --reruns-delay 2 -rR
+                touch /verdict/backend-green
+                # The frontend retest runs in its own container on this same
+                # merged tree. The push waits for its verdict, so a red
+                # frontend build aborts the merge exactly like a red suite.
+                for i in \$(seq 1 180); do
+                  [ -f /verdict/frontend-green ] && break
+                  sleep 5
+                done
+                [ -f /verdict/frontend-green ] || { echo "frontend retest did not go green"; exit 1; }
+                echo "TESTED_SHA=\$(git rev-parse HEAD)"
+                git push origin HEAD:${BR}
+              workingDir: /workspace
+              volumeMounts:
+              - name: workspace
+                mountPath: /workspace
+              - name: verdict
+                mountPath: /verdict
+              - name: netrc
+                mountPath: /root/.netrc
+                subPath: .netrc
+            # The frontend retest on the very tree the land container just
+            # merged: it waits for /verdict/merged, runs the same frontend
+            # checks the test job ran, then reports green or red. set -e makes
+            # a red build exit non-zero here (the pod goes Failed and the job
+            # prints this container's log), so the green marker below is
+            # written only after a green run.
+            - name: frontend
+              image: node:24-slim
+              command: ["/bin/sh", "-c"]
+              args:
+              - |
+                set -e
+                for i in \$(seq 1 90); do
+                  [ -f /verdict/merged ] && break
+                  sleep 5
+                done
+                [ -f /verdict/merged ] || { echo "frontend retest: no merged tree appeared"; exit 1; }
+                cd /workspace/frontend
+                npm ci --no-audit --no-fund
+                npx tsc -b --noEmit
+                npm run build
+                touch /verdict/frontend-green
+              workingDir: /workspace
+              volumeMounts:
+              - name: workspace
+                mountPath: /workspace
+              - name: verdict
+                mountPath: /verdict
+            volumes:
+            - name: workspace
+              emptyDir: {}
+            - name: verdict
+              emptyDir: {}
+            - name: netrc
+              secret:
+                secretName: ${SECRET}
+          YAML
+          POD="land-fubala-${{ gitea.run_id }}"
+          # Same timeout dump as the test job. The land block runs under
+          # `set -e`: every kubectl/grep here must stay || true-guarded or a
+          # no-match grep aborts the dump (and the job) midway.
+          dump_pod_logs() {
+            P="$1"
+            NAMES=$(kubectl get pod "${P}" -n gitea -o jsonpath='{.spec.initContainers[*].name} {.spec.containers[*].name}' 2>/dev/null) || true
+            for C in ${NAMES}; do
+              # One full fetch per container to /tmp: the tail and the grep
+              # below read that copy, so nothing is lost if the pod is
+              # deleted right after the dump. Under `set -e` (the land job)
+              # every kubectl/grep here must stay || true-guarded too.
+              kubectl logs "${P}" -n gitea -c "${C}" > "/tmp/${P}-${C}.log" 2>/dev/null || true
+              echo "=== ${P} / ${C}: last 200 lines ==="
+              tail -n 200 "/tmp/${P}-${C}.log" 2>/dev/null || true
+              echo "=== ${P} / ${C}: FAILED/ERROR/RERUN ==="
+              grep -E 'FAILED|ERROR|RERUN' "/tmp/${P}-${C}.log" 2>/dev/null || echo "no FAILED/ERROR/RERUN lines"
+            done
+          }
+          for i in $(seq 1 420); do
+            PHASE=$(kubectl get pod "${POD}" -n gitea -o jsonpath='{.status.phase}' 2>/dev/null || echo Pending)
+            if [ "$PHASE" = "Succeeded" ]; then break; fi
+            if [ "$PHASE" = "Failed" ]; then
+              echo "=== land (backend) log ==="
+              kubectl logs "${POD}" -n gitea -c land --tail=40 || true
+              echo "=== reruns (land) ==="
+              kubectl logs "${POD}" -n gitea -c land --tail=400 2>/dev/null | grep -E "^RERUN" || echo "no reruns"
+              echo "=== land (frontend) log ==="
+              kubectl logs "${POD}" -n gitea -c frontend --tail=40 || true
+              echo "=== pod events ==="
+              kubectl describe pod "${POD}" -n gitea | tail -15 || true
+              kubectl delete secret "${SECRET}" -n gitea --ignore-not-found >/dev/null 2>&1 || true
+              echo "branch update or retest is RED; keeping ${POD} for inspection (secret cleaned)"
+              exit 1
+            fi
+            sleep 5
+          done
+          if [ "${PHASE}" != "Succeeded" ]; then
+            dump_pod_logs "${POD}"
+            kubectl delete pod "${POD}" -n gitea --ignore-not-found >/dev/null 2>&1 || true
+            kubectl delete secret "${SECRET}" -n gitea --ignore-not-found >/dev/null 2>&1 || true
+            echo "Timeout waiting for land pod (pod and secret cleaned)"
+            exit 1
+          fi
+          # One log fetch before the delete serves both the tested sha and the
+          # rerun list: after `kubectl delete pod` the log is gone forever.
+          kubectl logs "${POD}" -n gitea -c land > /tmp/land.log 2>/dev/null || true
+          echo "=== reruns (land) ==="
+          if grep -E "^RERUN" /tmp/land.log; then
+            grep -E "^RERUN" /tmp/land.log >> "${GITEA_STEP_SUMMARY:-/dev/null}" || true
+          else
+            echo "no reruns"
+            echo "no reruns" >> "${GITEA_STEP_SUMMARY:-/dev/null}" || true
+          fi
+          TESTED=$(sed -n "s/^TESTED_SHA=//p" /tmp/land.log | tail -1)
+          kubectl delete pod "${POD}" -n gitea --ignore-not-found >/dev/null 2>&1 || true
+          kubectl delete secret "${SECRET}" -n gitea --ignore-not-found >/dev/null 2>&1 || true
+          [ -n "${TESTED}" ] || { echo "tested commit not found in pod log"; exit 1; }
+          # status ONLY on the exact commit the pod tested; merge only if that
+          # commit is still the branch head (someone may have pushed meanwhile)
+          curl -sS -f -X POST -H "${AUTH}" -H "Content-Type: application/json" \
+            -d '{"state":"success","target_url":"https://git.hoeve.nu/hoeve/fubala/actions","description":"suite green on the merge result (land job)","context":"ci / test (pull_request)"}' \
+            "${API}/statuses/${TESTED}" || echo "status post failed"
+          HEADNOW=$(curl -sS -H "${AUTH}" "${API}/branches/${BR}" | tr -d ' \n' | grep -o '"commit":{"id":"[0-9a-f]*"' | cut -d'"' -f6)
+          [ "${HEADNOW}" = "${TESTED}" ] || { echo "branch moved after the test (${HEADNOW} != ${TESTED}); aborting merge"; exit 1; }
+          # "already merged" is success, not a failure (the loop guard): Gitea
+          # answers 405 for a merged PR and 409 for a conflicting one.
+          CODE=$(curl -sS -o /tmp/merge-body -w '%{http_code}' -X POST -H "${AUTH}" -H "Content-Type: application/json" \
+            -d '{"Do":"merge","head_commit_id":"'"${TESTED}"'"}' "${API}/pulls/${PR}/merge")
+          echo "merge API returned ${CODE}"
+          case "${CODE}" in
+            200)
+              echo "merged (after branch update, tested ${TESTED}, Gitea verified the head)"
+              # A merge by the actions token starts no workflows, so the
+              # image for the new main must be started here explicitly:
+              # one dispatch, kaniko logic and the tag scheme stay solely in
+              # build.yaml (workflow_dispatch). 200 and 204 are both an
+              # accepted dispatch; anything else fails the job -- a landed
+              # story without an image must not look green.
+              DISPATCH=$(curl -sS -o /tmp/dispatch-body -w '%{http_code}' -X POST \
+                -H "${AUTH}" -H "Content-Type: application/json" \
+                -d '{"ref":"main","inputs":{"tested_sha":"'"${TESTED}"'"}}' "${API}/actions/workflows/build.yaml/dispatches")
+              case "${DISPATCH}" in
+                200|204) echo "dispatched image build for main @ ${TESTED}" ;;
+                *) echo "image build dispatch failed (HTTP ${DISPATCH}):"; head -c 500 /tmp/dispatch-body; echo; exit 1 ;;
+              esac ;;
+            # Already-merged (405) / not mergeable (409). The loop guard only
+            # covers a PR Gitea says actually merged: a refusal on an UNMERGED
+            # PR is a failed land (incident run 3053, PR 70 -- 409, exit 0,
+            # story parked in `landing` for 7h). No dispatch in either arm:
+            # this job merged nothing, and a coordinator merge of a CI PR
+            # triggers build.yaml via the normal push event.
+            405|409)
+              MERGED=$(curl -sS -H "${AUTH}" "${API}/pulls/${PR}" \
+                | tr -d ' \n' | grep -o '"merged":[a-z]*' | cut -d: -f2)
+              if [ "${MERGED}" = "true" ]; then
+                echo "PR ${PR} is already merged; body:"; head -c 300 /tmp/merge-body; echo
+              else
+                echo "merge API returned ${CODE}"; head -c 500 /tmp/merge-body; echo; exit 1
+              fi ;;
+            *) echo "merge failed:"; head -c 500 /tmp/merge-body; echo; exit 1 ;;
+          esac
+          echo "land job complete"

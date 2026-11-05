@@ -1,0 +1,18 @@
+# Build output and caches
+dist/
+coverage/
+*.tsbuildinfo
+
+# Never reflow lockfile-adjacent or generated files
+package-lock.json
+pnpm-lock.yaml
+
+# npm metadata: reformatting it creates churn with no style benefit
+package.json
+
+# Prose stays as authored (zero-churn baseline)
+*.md
+
+# Not ours to format
+backend/
+.fubala-worktrees/

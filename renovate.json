@@ -1,0 +1,37 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "timezone": "Europe/Amsterdam",
+  "schedule": ["before 6am on Monday"],
+  "prConcurrentLimit": 3,
+  "prHourlyLimit": 2,
+  "vulnerabilityAlerts": {
+    "schedule": []
+  },
+  "packageRules": [
+    {
+      "description": "typescript-eslint 8 supports typescript <6.1; hold TypeScript until it supports 7 (npm ci broke on 16 Oct)",
+      "matchPackageNames": ["typescript"],
+      "allowedVersions": "<6.1"
+    },
+    {
+      "description": "@vitejs/plugin-react majors require a matching vite major; upgrade them together",
+      "matchPackageNames": ["vite", "@vitejs/plugin-react", "vitest"],
+      "groupName": "vite"
+    },
+    {
+      "description": "Weekly npm group",
+      "matchManagers": ["npm"],
+      "groupName": "npm weekly"
+    },
+    {
+      "description": "Weekly python group",
+      "matchManagers": ["pep621"],
+      "groupName": "python weekly"
+    },
+    {
+      "description": "Weekly docker group",
+      "matchManagers": ["dockerfile"],
+      "groupName": "docker weekly"
+    }
+  ]
+}

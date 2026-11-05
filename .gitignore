@@ -1,0 +1,29 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
+
+# Node
+node_modules/
+frontend/dist/
+
+# App data
+backend/data/
+*.db
+*.db-journal
+
+# Env & secrets
+.env
+.env.local
+
+# Editors / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+.zcode/
+frontend/tsconfig.tsbuildinfo

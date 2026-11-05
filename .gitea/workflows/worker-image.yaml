@@ -1,0 +1,238 @@
+name: build fubala worker image
+
+# Multi-arch worker image (docs/worker-pods-design.md, section 5). Same kaniko
+# house pattern as build.yaml, with two differences: two build pods (one per
+# arch, via binfmt/qemu), and NO node pinning -- binfmt lets any node build
+# either arch. Publish is gated: both arch images, a candidate index, the
+# restricted-securityContext smoke pod; only then <TAG> and latest move.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docker/worker.Dockerfile'
+      - 'docker/worker-smoke.sh'
+      - '.gitea/workflows/worker-image.yaml'
+  workflow_dispatch:
+
+jobs:
+  worker-image:
+    runs-on: [self-hosted, amd64]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build, smoke and publish worker image
+        env:
+          GIT_TOKEN: ${{ secrets.GITEA_TOKEN }}
+        run: |
+          set -u
+          SHA="${{ github.sha }}"
+          SHORT="${SHA::8}"
+          RUN="${{ gitea.run_id }}"
+          TAG="$(date -u +%Y%m%d)-${RUN}"
+          NS=gitea
+          REPO=docker.hoeve.nu/fubala/fubala-worker
+          SECRET="kaniko-git-worker-${SHORT}-${RUN}"
+          PODS="kaniko-worker-amd64-${SHORT}-${RUN} kaniko-worker-arm64-${SHORT}-${RUN} crane-worker-${SHORT}-${RUN} smoke-worker-${SHORT}-${RUN} crane-publish-${SHORT}-${RUN}"
+
+          cleanup() {
+            for p in ${PODS}; do
+              kubectl delete pod "$p" -n ${NS} --ignore-not-found >/dev/null 2>&1 || true
+            done
+            kubectl delete secret "${SECRET}" -n ${NS} --ignore-not-found >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          kubectl create secret generic "${SECRET}" -n ${NS} \
+            --from-literal=.netrc="machine gitea.gitea.svc.cluster.local login hoeve password ${GIT_TOKEN}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          # wait_pod <pod> <tries>: 0 on Succeeded, 1 on Failed/timeout (10s per try)
+          wait_pod() {
+            for i in $(seq 1 "$2"); do
+              PHASE=$(kubectl get pod "$1" -n ${NS} -o jsonpath='{.status.phase}' 2>/dev/null || echo Pending)
+              [ "$PHASE" = "Succeeded" ] && return 0
+              [ "$PHASE" = "Failed" ] && return 1
+              sleep 10
+            done
+            return 1
+          }
+
+          dump() {
+            kubectl logs "$1" -n ${NS} --all-containers --tail=60 2>&1 || true
+          }
+
+          # Placement follows the worker placement rules (design section 5): no
+          # nodeName, no arch selector (binfmt registers qemu on whichever node
+          # the pod lands on), but tolerate the dev node taint and prefer those
+          # nodes so the qemu arm64 build does not always land on stor01.
+          PLACEMENT='  tolerations:
+            - key: hoeve.nu/dev
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+            affinity:
+              nodeAffinity:
+                preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 100
+                  preference:
+                    matchExpressions:
+                    - key: hoeve.nu/dev
+                      operator: In
+                      values: ["true"]'
+          # Privileged / registry-tooling images: exact version plus digest.
+          BINFMT_IMAGE=tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          # crane: gcr.io publishes only the moving `debug` tag for the debug
+          # variant (crane v0.22.1 at pin time); the digest is the real pin.
+          CRANE_IMAGE=gcr.io/go-containerregistry/crane:debug@sha256:e78770b31258a3846f878036d9c1f63fbe4c871f9f56990bf77fd95c013e3c1b
+          build_pod() {
+            ARCH="$1"
+            POD="kaniko-worker-${ARCH}-${SHORT}-${RUN}"
+            kubectl -n ${NS} apply -f - <<YAML
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: ${POD}
+            namespace: ${NS}
+          spec:
+            restartPolicy: Never
+            automountServiceAccountToken: false
+          ${PLACEMENT}
+            initContainers:
+            - name: binfmt
+              image: ${BINFMT_IMAGE}
+              args: ["--install", "all"]
+              securityContext:
+                privileged: true
+            - name: git-clone
+              image: alpine:3.20
+              command: ["/bin/sh", "-c"]
+              args:
+              - |
+                set -e
+                apk add --no-cache git ca-certificates
+                git clone --depth 1 --branch "${{ gitea.ref_name }}" \
+                  "http://gitea.gitea.svc.cluster.local:3000/hoeve/fubala.git" /workspace
+                git -C /workspace checkout ${SHA}
+              volumeMounts:
+              - name: workspace
+                mountPath: /workspace
+              - name: netrc
+                mountPath: /root/.netrc
+                subPath: .netrc
+            containers:
+            - name: kaniko
+              image: gcr.io/kaniko-project/executor:v1.23.2-debug
+              args:
+              - --context=dir:///workspace
+              - --dockerfile=/workspace/docker/worker.Dockerfile
+              - --custom-platform=linux/${ARCH}
+              - --destination=${REPO}:${TAG}-${ARCH}
+              - --cache=false
+              - --snapshot-mode=redo
+              - --insecure
+              - --insecure-pull
+              - --skip-tls-verify
+              volumeMounts:
+              - name: workspace
+                mountPath: /workspace
+            volumes:
+            - name: workspace
+              emptyDir: {}
+            - name: netrc
+              secret:
+                secretName: ${SECRET}
+          YAML
+          }
+
+          build_pod amd64
+          build_pod arm64
+
+          echo "Waiting for both arch builds (each runs the in-build smoke)..."
+          FAIL=0
+          wait_pod "kaniko-worker-amd64-${SHORT}-${RUN}" 270 || { echo "amd64 build FAILED"; dump "kaniko-worker-amd64-${SHORT}-${RUN}"; FAIL=1; }
+          wait_pod "kaniko-worker-arm64-${SHORT}-${RUN}" 270 || { echo "arm64 build FAILED"; dump "kaniko-worker-arm64-${SHORT}-${RUN}"; FAIL=1; }
+          [ "${FAIL}" = 0 ] || { echo "an arch build failed: nothing published"; exit 1; }
+
+          echo "Both arch images green: assembling candidate index"
+          CAND="crane-worker-${SHORT}-${RUN}"
+          kubectl -n ${NS} apply -f - <<YAML
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: ${CAND}
+            namespace: ${NS}
+          spec:
+            restartPolicy: Never
+            automountServiceAccountToken: false
+          ${PLACEMENT}
+            containers:
+            - name: crane
+              image: ${CRANE_IMAGE}
+              command: ["/busybox/sh", "-c"]
+              args:
+              - |
+                set -e
+                crane index append --insecure \
+                  -m ${REPO}:${TAG}-amd64 -m ${REPO}:${TAG}-arm64 \
+                  -t ${REPO}:${TAG}-candidate
+          YAML
+          wait_pod "crane-worker-${SHORT}-${RUN}" 30 || { dump "crane-worker-${SHORT}-${RUN}"; exit 1; }
+
+          echo "Running smoke in a restricted-securityContext pod"
+          SMOKE="smoke-worker-${SHORT}-${RUN}"
+          kubectl -n ${NS} apply -f - <<YAML
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: ${SMOKE}
+            namespace: ${NS}
+          spec:
+            restartPolicy: Never
+            automountServiceAccountToken: false
+          ${PLACEMENT}
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 10003
+              runAsGroup: 10003
+              seccompProfile:
+                type: RuntimeDefault
+            containers:
+            - name: smoke
+              image: ${REPO}:${TAG}-candidate
+              command: ["/bin/sh", "-c", "id -u && /usr/local/bin/worker-smoke"]
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+          YAML
+          wait_pod "${SMOKE}" 60 || { echo "restricted smoke FAILED"; dump "${SMOKE}"; exit 1; }
+          kubectl logs "${SMOKE}" -n ${NS}
+          kubectl logs "${SMOKE}" -n ${NS} | head -1 | grep -qx 10003 || { echo "id -u is not 10003"; exit 1; }
+
+          echo "Green: publishing ${TAG} and latest"
+          PUB="crane-publish-${SHORT}-${RUN}"
+          kubectl -n ${NS} apply -f - <<YAML
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: ${PUB}
+            namespace: ${NS}
+          spec:
+            restartPolicy: Never
+            automountServiceAccountToken: false
+          ${PLACEMENT}
+            containers:
+            - name: crane
+              image: ${CRANE_IMAGE}
+              command: ["/busybox/sh", "-c"]
+              args:
+              - |
+                set -e
+                crane copy --insecure ${REPO}:${TAG}-candidate ${REPO}:${TAG}
+                crane copy --insecure ${REPO}:${TAG}-candidate ${REPO}:latest
+                crane manifest --insecure ${REPO}:${TAG}
+          YAML
+          wait_pod "${PUB}" 30 || { dump "${PUB}"; exit 1; }
+          kubectl logs "${PUB}" -n ${NS}
+          echo "IMAGE=${REPO}:${TAG}"

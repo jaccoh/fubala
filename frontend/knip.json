@@ -1,0 +1,16 @@
+{
+  "$schema": "https://unpkg.com/knip@5/schema.json",
+  "entry": [
+    "src/main.tsx",
+    "vite.config.ts",
+    "vitest.config.ts",
+    "src/**/*.test.ts",
+    "src/**/*.test.tsx"
+  ],
+  "project": ["src/**/*.{ts,tsx}", "*.config.ts"],
+  "ignore": ["src/index.css", "src/vite-env.d.ts"],
+  "ignoreDependencies": [
+    "highlight.js",
+    "tailwindcss"
+  ]
+}

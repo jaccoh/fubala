@@ -1,0 +1,15 @@
+[project]
+name = "fubala-macos"
+version = "0.1.0"
+license = "MIT"
+description = "Fubala menu-bar launcher for the uvicorn server"
+requires-python = ">=3.12"
+dependencies = [
+    "rumps",
+]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = ["py2app"]

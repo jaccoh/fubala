@@ -1,0 +1,216 @@
+name: build fubala image
+
+# Kaniko house pattern (copied from hoeve/ems): the runner has no docker;
+# buildah-in-k8s segfaults on this host. Kaniko pod + git-clone initContainer.
+# Pushes to the house registry (plain CNCF distribution, no auth on push).
+# Tests run inside the image build (Dockerfile test stage).
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - 'docker/**'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - '.gitea/workflows/build.yaml'
+  workflow_dispatch:
+    inputs:
+      tested_sha:
+        description: 'Commit whose tree CI already tested (land job); empty = run the tests'
+        required: false
+        type: string
+
+jobs:
+  build:
+    runs-on: [self-hosted, amd64]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Decide SKIP_TESTS. Default is to run the tests; skip only on proof that
+      # CI already passed the same tree.
+      - name: Decide whether the image build re-runs the suite
+        env:
+          GIT_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          EVENT: ${{ gitea.event_name }}
+          TESTED_SHA: ${{ inputs.tested_sha }}
+        run: |
+          SHA="${{ github.sha }}"
+          API="https://git.hoeve.nu/api/v1/repos/hoeve/fubala"
+          AUTH="Authorization: token ${GIT_TOKEN}"
+          # Gitea status contexts are "<workflow> / <job> (<event>)"
+          PR_CTX="ci / test (pull_request)"
+          PUSH_CTX="ci / test (push)"
+          SKIP=""
+          REASON="default: run the tests"
+
+          # prints the state of context $2 on commit $1 ("" on any error)
+          ctx_state() {
+            curl -sS -f -m 30 -H "${AUTH}" "${API}/commits/$1/statuses?limit=50" 2>/dev/null \
+              | python3 -c 'import json,sys; print(next((s.get("status") or s.get("state") for s in json.load(sys.stdin) if s.get("context")==sys.argv[1]), ""))' "$2" 2>/dev/null || true
+          }
+
+          if [ "${EVENT}" = "workflow_dispatch" ]; then
+            if [ -z "${TESTED_SHA}" ]; then
+              REASON="dispatch without tested_sha"
+            elif ! git rev-parse --verify -q "${TESTED_SHA}^{commit}" >/dev/null; then
+              REASON="tested_sha ${TESTED_SHA} not in the clone"
+            else
+              T1=$(git rev-parse "${SHA}^{tree}")
+              T2=$(git rev-parse "${TESTED_SHA}^{tree}")
+              if [ "${T1}" != "${T2}" ]; then
+                REASON="tree of ${SHA::8} (${T1::8}) differs from tested ${TESTED_SHA::8} (${T2::8}); main moved"
+              else
+                STATE=$(ctx_state "${TESTED_SHA}" "${PR_CTX}")
+                if [ "${STATE}" = "success" ]; then
+                  SKIP=1; REASON="same tree as ${TESTED_SHA::8}, '${PR_CTX}' is success"
+                else
+                  REASON="same tree but '${PR_CTX}' on ${TESTED_SHA::8} is '${STATE:-unknown}'"
+                fi
+              fi
+            fi
+          elif [ "${EVENT}" = "push" ]; then
+            REASON="no '${PUSH_CTX}' success within 25 min"
+            for i in $(seq 1 100); do
+              STATE=$(ctx_state "${SHA}" "${PUSH_CTX}")
+              echo "  poll ${i}/100: '${PUSH_CTX}' = '${STATE:-none}'"
+              if [ "${STATE}" = "success" ]; then
+                SKIP=1; REASON="'${PUSH_CTX}' is success on ${SHA::8}"; break
+              fi
+              case "${STATE}" in
+                failure|error) REASON="'${PUSH_CTX}' is ${STATE}"; break ;;
+              esac
+              sleep 15
+            done
+          else
+            REASON="unexpected event '${EVENT}'"
+          fi
+
+          echo "SKIP_TESTS=${SKIP}" >> "$GITHUB_ENV"
+          if [ -n "${SKIP}" ]; then
+            echo "DECISION: skip the test suite in the image build (${REASON})"
+          else
+            echo "DECISION: run the test suite in the image build (${REASON})"
+          fi
+
+      - name: Build and push image (kaniko pod, house pattern)
+        env:
+          # Gitea auto-provides this repo-scoped token (like GITHUB_TOKEN)
+          GIT_TOKEN: ${{ secrets.GITEA_TOKEN }}
+        run: |
+          SHA="${{ github.sha }}"
+          SHORT="${SHA::8}"
+          TAG="$(date -u +%Y%m%d)-${{ gitea.run_id }}"
+          POD="kaniko-fubala-${SHORT}-${{ gitea.run_id }}"
+          SECRET="kaniko-git-fubala-${SHORT}"
+
+          kubectl create secret generic "${SECRET}" -n gitea \
+            --from-literal=.netrc="machine gitea.gitea.svc.cluster.local login hoeve password ${GIT_TOKEN}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl -n gitea apply -f - <<YAML
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: ${POD}
+            namespace: gitea
+          spec:
+            nodeSelector:
+              kubernetes.io/arch: amd64
+            tolerations:
+            - key: hoeve.nu/dev
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+            affinity:
+              nodeAffinity:
+                preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 100
+                  preference:
+                    matchExpressions:
+                    - key: hoeve.nu/dev
+                      operator: In
+                      values: ["true"]
+            restartPolicy: Never
+            initContainers:
+            - name: git-clone
+              image: alpine:3.20
+              command: ["/bin/sh", "-c"]
+              args:
+              - |
+                set -e
+                apk add --no-cache git ca-certificates
+                git clone --depth 1 --branch "${{ gitea.ref_name }}" \
+                  "http://gitea.gitea.svc.cluster.local:3000/hoeve/fubala.git" /workspace
+                git -C /workspace checkout ${SHA}
+              volumeMounts:
+              - name: workspace
+                mountPath: /workspace
+              - name: netrc
+                mountPath: /root/.netrc
+                subPath: .netrc
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+            containers:
+            - name: kaniko
+              image: gcr.io/kaniko-project/executor:v1.23.2-debug
+              args:
+              - --context=dir:///workspace
+              - --dockerfile=/workspace/Dockerfile
+              - --destination=docker.hoeve.nu/fubala/fubala:${TAG}
+              - --destination=docker.hoeve.nu/fubala/fubala:latest
+              - --cache=false
+              - --snapshot-mode=redo
+              - --build-arg=SKIP_TESTS=${SKIP_TESTS}
+              - --insecure
+              - --insecure-pull
+              - --skip-tls-verify
+              resources:
+                requests:
+                  cpu: 1
+                  memory: 2Gi
+                limits:
+                  cpu: 2
+                  memory: 6Gi
+              volumeMounts:
+              - name: workspace
+                mountPath: /workspace
+            volumes:
+            - name: workspace
+              emptyDir: {}
+            - name: netrc
+              secret:
+                secretName: ${SECRET}
+          YAML
+
+          cleanup() {
+            kubectl delete pod "${POD}" -n gitea --ignore-not-found >/dev/null 2>&1 || true
+            kubectl delete secret "${SECRET}" -n gitea --ignore-not-found >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          echo "Waiting for Kaniko pod ${POD}..."
+          for i in $(seq 1 210); do
+            PHASE=$(kubectl get pod "${POD}" -n gitea -o jsonpath='{.status.phase}' 2>/dev/null || echo Pending)
+            printf "  %3d/210: %s\n" "$i" "$PHASE"
+            if [ "$PHASE" = "Succeeded" ]; then
+              echo "IMAGE=docker.hoeve.nu/fubala/fubala:${TAG}"
+              exit 0
+            fi
+            if [ "$PHASE" = "Failed" ]; then
+              kubectl logs "${POD}" -n gitea -c kaniko --tail=60 || true
+              kubectl logs "${POD}" -n gitea -c git-clone --tail=20 2>/dev/null || true
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "Timeout waiting for Kaniko pod"
+          exit 1
