@@ -9,6 +9,7 @@ works headless — the Auto-Claude lesson.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import glob
 import hashlib
 import json
@@ -18,6 +19,7 @@ import re
 import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -1744,6 +1746,8 @@ def story_payload(story: Story, project_executor: str | None = None) -> dict[str
         "pr_url": story.pr_url,
         "pr_index": story.pr_index,
         "pushed_sha": story.pushed_sha,
+        # in-memory only: working | waiting_tests | waiting_slot | None
+        "slot_state": _SLOT_STATE.get(story.id),
         "created_at": as_utc_iso(story.created_at),
         "updated_at": as_utc_iso(story.updated_at),
     }
@@ -3127,6 +3131,91 @@ def _reconcile_one_failed(db: Session, story: Story) -> None:
     )
 
 
+# slot_state per story id, in memory only (no DB column): what the story is
+# doing in the slot pools right now. Read by story_payload, so the API and
+# every SSE story event carry it; a restart starts with empty pools.
+SLOT_WORKING = "working"
+SLOT_WAITING_TESTS = "waiting_tests"
+SLOT_WAITING_SLOT = "waiting_slot"
+_SLOT_STATE: dict[str, str] = {}
+
+
+def slot_state(story_id: str) -> str | None:
+    return _SLOT_STATE.get(story_id)
+
+
+class SlotPool:
+    """A counted pool of concurrency slots with strict FIFO grants.
+
+    Unlike asyncio.Semaphore, waiters sit in an explicit deque of futures,
+    so the order is exactly the order of `acquire()` calls: a request queues
+    at the moment it asks, and that is the only ordering rule. The pool
+    records which story holds each slot. `resize()` (called every tick) never
+    interrupts a holder; a smaller size only blocks new grants."""
+
+    def __init__(
+        self, name: str, size: int, on_change: Callable[[], None] | None = None
+    ) -> None:
+        self.name = name
+        self.size = max(1, int(size))
+        self.on_change = on_change
+        self._holders: list[str] = []
+        self._waiters: deque[tuple[str, asyncio.Future[None]]] = deque()
+
+    def holders(self) -> list[str]:
+        return list(self._holders)
+
+    def waiting(self) -> list[str]:
+        return [sid for sid, fut in self._waiters if not fut.done()]
+
+    def resize(self, size: int) -> None:
+        size = max(1, int(size))
+        if size != self.size:
+            self.size = size
+            self._grant()
+
+    async def acquire(self, story_id: str) -> None:
+        if not self._waiters and len(self._holders) < self.size:
+            self._holders.append(story_id)
+            self._changed()
+            return
+        fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._waiters.append((story_id, fut))
+        self._changed()
+        try:
+            await fut
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled():
+                # granted in the same step as the cancel: hand it back
+                self.release(story_id)
+            else:
+                fut.cancel()
+                self._waiters = deque(w for w in self._waiters if w[1] is not fut)
+                self._grant()
+            raise
+
+    def release(self, story_id: str) -> None:
+        with contextlib.suppress(ValueError):
+            self._holders.remove(story_id)
+        self._grant()
+
+    def _grant(self) -> None:
+        while self._waiters and len(self._holders) < self.size:
+            story_id, fut = self._waiters.popleft()
+            if fut.done():
+                continue  # cancelled while queued
+            self._holders.append(story_id)
+            fut.set_result(None)
+        self._changed()
+
+    def _changed(self) -> None:
+        if self.on_change is not None:
+            try:
+                self.on_change()
+            except Exception:  # noqa: BLE001 - a listener never breaks a grant
+                log.exception("slot pool %s change listener failed", self.name)
+
+
 class StoryRunner:
     def __init__(
         self,
@@ -3205,9 +3294,98 @@ class StoryRunner:
         self._executors: dict[str, pods.PodExecutor] = {}
         # next monotonic time the live worker pods get their heartbeat touch
         self._next_pod_beat: float = 0.0
+        # concurrency is slots, not stories: any number of stories is in
+        # flight, a story holds a model slot only while a model call runs and
+        # a test slot only while its verify runs. Sizes are re-read every
+        # tick (model_slots, test_slots).
+        self._model_pool = SlotPool(
+            "model", int(DEFAULTS["model_slots"]), self._publish_slot_states
+        )
+        self._test_pool = SlotPool(
+            "test", int(DEFAULTS["test_slots"]), self._publish_slot_states
+        )
+        self._slot_states: dict[str, str] = {}
+        # coder runs whose worker pod / backend-node claim was set up inside
+        # their first granted model slot (never at pickup)
+        self._gated: set[str] = set()
 
     def is_running(self, story_id: str) -> bool:
         return story_id in self._running
+
+    # -- slots -----------------------------------------------------------
+
+    def _publish_slot_states(self) -> None:
+        """Recompute every story's slot_state from the two pools and publish
+        the ones that changed (SSE `story_slot`)."""
+        states: dict[str, str] = {}
+        for sid in self._model_pool.waiting():
+            states[sid] = SLOT_WAITING_SLOT
+        for sid in self._test_pool.waiting() + self._test_pool.holders():
+            states[sid] = SLOT_WAITING_TESTS
+        for sid in self._model_pool.holders():
+            states[sid] = SLOT_WORKING
+        changed = [
+            sid
+            for sid in set(self._slot_states) | set(states)
+            if self._slot_states.get(sid) != states.get(sid)
+        ]
+        for sid in changed:
+            if sid in states:
+                _SLOT_STATE[sid] = states[sid]
+            else:
+                _SLOT_STATE.pop(sid, None)
+        self._slot_states = states
+        for sid in changed:
+            bus.publish("story_slot", {"story_id": sid, "slot_state": states.get(sid)})
+
+    @contextlib.asynccontextmanager
+    async def _model_slot(self, story_id: str) -> AsyncIterator[None]:
+        """Held around one LLM call (spec writer, AI reviewer, coder round,
+        code reviewer) and nothing else. Released on normal exit and on any
+        exception, a 429 included: provider holds, verify, review queues and
+        human gates all wait outside it."""
+        await self._model_pool.acquire(story_id)
+        try:
+            if story_id in self._running:
+                # the watchdog measures silence from the grant, not the queue
+                self._last_event[story_id] = time.monotonic()
+            yield
+        finally:
+            self._model_pool.release(story_id)
+
+    @contextlib.asynccontextmanager
+    async def _test_slot(self, story_id: str) -> AsyncIterator[None]:
+        """Held for one whole verify run (in-process or in the worker pod).
+        Never taken while the story holds a model slot."""
+        await self._test_pool.acquire(story_id)
+        try:
+            if story_id in self._running:
+                self._last_event[story_id] = time.monotonic()
+            yield
+        finally:
+            self._test_pool.release(story_id)
+
+    @contextlib.asynccontextmanager
+    async def _coder_slot(self, story_id: str) -> AsyncIterator[None]:
+        """The model slot of one coder round. The run's worker pod (or its
+        backend-node fallback claim) is set up inside the run's FIRST granted
+        slot, never at pickup: a story queued for a slot holds no pod, and
+        queue time never counts against the pod's deadline. A full fallback
+        cap requeues the story (the slot is released on the way out)."""
+        async with self._model_slot(story_id):
+            if story_id not in self._gated:
+                if not await self._fallback_gate(story_id):
+                    raise _HeadlessRequeued()
+                self._gated.add(story_id)
+            yield
+
+    def _stamp_slot_waiters(self) -> None:
+        """A run queued for a slot is silent on the bus by design; keep it
+        fresh for the watchdog while it waits."""
+        now = time.monotonic()
+        for sid in self._model_pool.waiting() + self._test_pool.waiting():
+            if sid in self._running:
+                self._last_event[sid] = now
 
     def _report_proc_cleanup(
         self, story_id: str, reason: str, entries: list[dict[str, Any]]
@@ -3316,6 +3494,7 @@ class StoryRunner:
         self._attempts.pop(story_id, None)
         self._watchdog_floor.pop(story_id, None)
         self._prompt_tokens.pop(story_id, None)
+        self._gated.discard(story_id)
         executor = self._executors.pop(story_id, None)
         if executor is not None:
             self._close_executor(executor)
@@ -3381,7 +3560,8 @@ class StoryRunner:
                 self._tick_interval = interval
                 if lock_backoff == 0.0:
                     await asyncio.sleep(interval)
-                await self._tick(settings["max_parallel_stories"])
+                self._test_pool.resize(int(settings["test_slots"]))
+                await self._tick(int(settings["model_slots"]))
                 ticked = True
             except Exception as exc:  # scheduler must never die
                 if _is_locked_db(exc):
@@ -3678,32 +3858,34 @@ class StoryRunner:
             if announced:
                 self._clear_watchdog_floor(story_id)
 
-    async def _tick(self, max_parallel: int) -> None:
+    async def _tick(self, model_slots: int) -> None:
+        # the pool size is re-read every tick; shrinking never interrupts a
+        # holder, it only blocks new grants
+        self._model_pool.resize(model_slots)
         try:
-            # Reclaim leases before looking for work: a saturated board
-            # (max_parallel early return below) must still heal stale claims.
+            # Reclaim leases before looking for work: the train CI hold
+            # below must not keep stale claims from healing.
             self._release_stale_claims()
         except Exception:  # noqa: BLE001 - a sweep failure must not abort candidates
             log.exception("stale-claim sweep failed")
 
-        # Push+PR stories in `landing` are watched BEFORE the max_parallel
-        # early return: they hold no coder slot, and a saturated board must
-        # still land merged PRs.
+        # Push+PR stories in `landing` are watched BEFORE pickup: they hold
+        # no slot, and a busy board must still land merged PRs.
         try:
             await self._poll_landing()
         except Exception:  # noqa: BLE001 - the poller must never kill the tick
             log.exception("landing poller failed")
 
         # Failed stories whose branch actually merged self-heal here, under
-        # the same saturation-exempt conditions as the landing poller.
+        # the same conditions as the landing poller.
         try:
             await self._reconcile_failed()
         except Exception:  # noqa: BLE001 - the sweep must never kill the tick
             log.exception("failed-reconcile sweep failed")
 
         # Merge trains: flush forming batches past their window and judge the
-        # open batch PRs. Same saturation exemption — a batch PR merging must
-        # still land its members.
+        # open batch PRs. Like the poller, this runs before pickup — a batch
+        # PR merging must still land its members.
         try:
             from . import train as train_module
 
@@ -3715,12 +3897,11 @@ class StoryRunner:
         except Exception:  # noqa: BLE001 - the train must never kill the tick
             log.exception("merge train tick failed")
 
+        self._stamp_slot_waiters()
         self._watchdog_drain()
         await self._watchdog_sweep()
         await self._proc_sweep()
         await self._pod_heartbeat()
-        if len(self._running) >= max_parallel:
-            return
         if self._train_ci_gate():
             return
         with session_scope(self.engine) as db:
@@ -3801,8 +3982,10 @@ class StoryRunner:
             ordered = sorted(orphans, key=lambda s: s.updated_at) + sorted(
                 waiting, key=lambda s: fair_order_key(s, utcnow())
             )
-            payload: dict[str, Any] | None = None
-            is_coder_run = False
+            # every eligible story starts a task, in this order; the tasks
+            # then queue on the slot pools (a request queues the moment it
+            # asks, so this order is also the first-slot order)
+            launches: list[tuple[dict[str, Any], bool]] = []
             for story in ordered:
                 self._backoff.pop(story.id, None)
                 prev = story.status
@@ -3981,14 +4164,18 @@ class StoryRunner:
                 story.updated_at = utcnow()
                 db.add(story)
                 record_event(db, story.id, "status", {"from": prev, "to": story.status})
-                payload = story_payload(story)
-                is_coder_run = is_coder
-                break
-            if payload is None:
+                launches.append((story_payload(story), is_coder))
+            if not launches:
                 return
+        for payload, is_coder_run in launches:
+            self._launch(payload, is_coder_run)
+
+    def _launch(self, payload: dict[str, Any], is_coder_run: bool) -> None:
         bus.publish("story", {"story": payload})
         self._running.add(payload["id"])
         if is_coder_run:
+            # the executor object only: its pod is created inside the run's
+            # first granted model slot (_coder_slot), never here
             executor = self._make_executor(payload["id"], asyncio.get_running_loop())
             if executor is not None:
                 self._executors[payload["id"]] = executor
@@ -4056,6 +4243,7 @@ class StoryRunner:
             return  # a newer run owns this story id now
         self._tasks.pop(story_id, None)
         pods.release_fallback(story_id)
+        self._gated.discard(story_id)
         self._running.discard(story_id)
         self._last_event.pop(story_id, None)
         self._watchdog_floor.pop(story_id, None)
@@ -4199,8 +4387,8 @@ class StoryRunner:
 
     async def _run_coder(self, story_id: str) -> None:
         try:
-            if not await self._fallback_gate(story_id):
-                return
+            # the fallback gate (worker pod / backend-node claim) runs inside
+            # the first coder round's model slot: see _coder_slot
             await self._execute_story(story_id)
             await self._run_code_review(story_id)
         except _HeadlessRequeued:
@@ -4709,19 +4897,22 @@ class StoryRunner:
         cli_target = self._claude_code_target(model) if schemas else None
         spec_effort = self._cli_effort(model, settings.get("spec_effort"))
         self._record_phase(story_id, "spec", model, spec_effort)
-        if cli_target is not None:
-            # Claude Max: the spec writer is one Claude Code session in the
-            # project root with read-only built-ins (Read, Grep, Glob), not
-            # Fubala's tool loop (the OAuth token only works via the CLI)
-            result = await self._run_spec_cli(
-                story_id, cli_target, spec_messages, spec_root, settings, policy,
-                spec_effort,
-            )
-        else:
-            result = await self._run_spec_agent(
-                story_id, model, spec_messages, schemas, guarded, settings, policy,
-                spec_effort,
-            )
+        # one model slot per spec call; a pod spec session builds its pod
+        # (and graph) only inside it
+        async with self._model_slot(story_id):
+            if cli_target is not None:
+                # Claude Max: the spec writer is one Claude Code session in the
+                # project root with read-only built-ins (Read, Grep, Glob), not
+                # Fubala's tool loop (the OAuth token only works via the CLI)
+                result = await self._run_spec_cli(
+                    story_id, cli_target, spec_messages, spec_root, settings, policy,
+                    spec_effort,
+                )
+            else:
+                result = await self._run_spec_agent(
+                    story_id, model, spec_messages, schemas, guarded, settings, policy,
+                    spec_effort,
+                )
 
         # Deliverable guard: a thinking-only phase must not pass stale tool-
         # round narration off as the spec. Incomplete runs and texts missing
@@ -4767,34 +4958,35 @@ class StoryRunner:
             {"role": "assistant", "content": spec_text or "(no output)"},
             {"role": "user", "content": corrective},
         ]
-        if cli_target is not None and self._spec_pod(story_id, spec_root) is not None:
-            # the main session ran in the worker pod: so does the nudge
-            text, usage = await self._spec_cli_session(
-                story_id, cli_target, nudge_messages, spec_root, settings,
-                cli_tools="", max_turns=None,
-                timeout=float(policy.timeout_seconds or 600),
-                effort=spec_effort, spec_tag=f"{story_id}-spec",
-            )
-            second = AgentResult(
-                text=text,
-                usage=usage,
-                rounds=1,
-                tool_calls=0,
-                complete=(usage.finish_reason or "") != "length",
-            )
-        else:
-            second = await run_agent(
-                self.gateway,
-                model=model,
-                messages=nudge_messages,
-                tools=None,
-                max_output_tokens=_phase_budget(settings, "spec_max_output_tokens"),
-                max_output_tokens_cap=int(
-                    settings.get("agent_max_output_tokens_cap", 32768) or 0
+        async with self._model_slot(story_id):
+            if cli_target is not None and self._spec_pod(story_id, spec_root) is not None:
+                # the main session ran in the worker pod: so does the nudge
+                text, usage = await self._spec_cli_session(
+                    story_id, cli_target, nudge_messages, spec_root, settings,
+                    cli_tools="", max_turns=None,
+                    timeout=float(policy.timeout_seconds or 600),
+                    effort=spec_effort, spec_tag=f"{story_id}-spec",
                 )
-                or None,
-                effort=spec_effort,
-            )
+                second = AgentResult(
+                    text=text,
+                    usage=usage,
+                    rounds=1,
+                    tool_calls=0,
+                    complete=(usage.finish_reason or "") != "length",
+                )
+            else:
+                second = await run_agent(
+                    self.gateway,
+                    model=model,
+                    messages=nudge_messages,
+                    tools=None,
+                    max_output_tokens=_phase_budget(settings, "spec_max_output_tokens"),
+                    max_output_tokens_cap=int(
+                        settings.get("agent_max_output_tokens_cap", 32768) or 0
+                    )
+                    or None,
+                    effort=spec_effort,
+                )
         if second.complete and _deliverable_ok(second.text, story_kind):
             self._finish(
                 story_id,
@@ -5346,35 +5538,36 @@ class StoryRunner:
                 self.engine, story_id, policy.timeout_seconds, verify_timeout
             )
             try:
-                await run_agent(
-                    self.gateway,
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt},
-                    ],
-                    tools=toolbox.schemas() or None,
-                    execute=guarded,
-                    on_tool_start=span_start,
-                    on_tool_end=span_end,
-                    on_delta=lambda text: bus.publish(
-                        "story_log", {"story_id": story_id, "text": text}
-                    ),
-                    on_tool=activity_tool_hook(self.engine, story_id),
-                    on_progress=self._progress_hook(story_id, "coder"),
-                    max_tool_calls=policy.max_tool_calls,
-                    timeout_seconds=policy.timeout_seconds,
-                    max_output_tokens=_phase_budget(
-                        load_settings(self.engine), "coder_max_output_tokens"
-                    ),
-                    max_output_tokens_cap=int(
-                        load_settings(self.engine).get("agent_max_output_tokens_cap", 32768)
-                        or 0
+                async with self._coder_slot(story_id):
+                    await run_agent(
+                        self.gateway,
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": prompt},
+                        ],
+                        tools=toolbox.schemas() or None,
+                        execute=guarded,
+                        on_tool_start=span_start,
+                        on_tool_end=span_end,
+                        on_delta=lambda text: bus.publish(
+                            "story_log", {"story_id": story_id, "text": text}
+                        ),
+                        on_tool=activity_tool_hook(self.engine, story_id),
+                        on_progress=self._progress_hook(story_id, "coder"),
+                        max_tool_calls=policy.max_tool_calls,
+                        timeout_seconds=policy.timeout_seconds,
+                        max_output_tokens=_phase_budget(
+                            load_settings(self.engine), "coder_max_output_tokens"
+                        ),
+                        max_output_tokens_cap=int(
+                            load_settings(self.engine).get("agent_max_output_tokens_cap", 32768)
+                            or 0
+                        )
+                        or None,
+                        on_correction=on_correction,
+                        log_context=story_id,
                     )
-                    or None,
-                    on_correction=on_correction,
-                    log_context=story_id,
-                )
             finally:
                 # the pump's CODE-stage run note: the same shape the headless
                 # executor records, so the executor report (wall time per run,
@@ -5588,74 +5781,77 @@ class StoryRunner:
                     {**payload, "phase": "coder", "executor": StoryExecution.HEADLESS},
                 )
 
-            # run_executor=pod: the CLI runs in the run's worker pod. A merge
-            # in progress (conflict resolution round) stays local: MERGE_HEAD
-            # does not travel in the snapshot bundle.
-            pod_ex = self._executors.get(story_id)
-            use_pod = bool(
-                pod_ex is not None
-                and pod_ex.mode == "pod"
-                and not pod_ex.disabled
-                and project_root
-                and not await asyncio.to_thread(workspaces.merge_in_progress, workspace_path)
-            )
-            graph_on = self._code_graph_project(story_id)[1]
-            if graph_on:
-                # the pod builds its own graph under /tmp; locally the graph
-                # lives in the data dir. Never in the worktree.
-                config.mcp_config = (
-                    code_graph.pod_mcp_config_json(pods.REPO_DIR)
-                    if use_pod
-                    else await self._graph_mcp(story_id, workspace_path)
+            # one model slot for the whole CLI run (tests it runs inside the
+            # run included); the pod is set up inside it (_coder_slot)
+            async with self._coder_slot(story_id):
+                # run_executor=pod: the CLI runs in the run's worker pod. A merge
+                # in progress (conflict resolution round) stays local: MERGE_HEAD
+                # does not travel in the snapshot bundle.
+                pod_ex = self._executors.get(story_id)
+                use_pod = bool(
+                    pod_ex is not None
+                    and pod_ex.mode == "pod"
+                    and not pod_ex.disabled
+                    and project_root
+                    and not await asyncio.to_thread(workspaces.merge_in_progress, workspace_path)
                 )
-            floor = config.timeout_seconds + (pods.EXEC_MARGIN + 300.0 if use_pod else 0.0)
-            self._set_watchdog_floor(story_id, floor)
-            try:
-                outcome: headless_exec.HeadlessOutcome | None = None
-                if use_pod:
-                    assert pod_ex is not None
-                    try:
-                        outcome = await asyncio.to_thread(
-                            pod_ex.run_headless,
-                            prompt,
-                            config,
-                            on_stream,
-                            workspace=workspace_path,
-                            project_root=project_root,
-                            commit_message=f"story {story_id}: coder output",
-                            on_artefacts=_artefact_note_writer(self, story_id),
-                        )
-                    except pods.PodUnavailable:
-                        outcome = None  # before the exec started: run locally
-                        if graph_on:
-                            config.mcp_config = await self._graph_mcp(
-                                story_id, workspace_path
-                            )
-                    except pods.PodRunLost as e:
-                        # after it started: never rerun the round locally.
-                        # The first loss requeues the story, a second fails
-                        # it. After a cancel the endpoint marks the story
-                        # failed itself, so only abort.
-                        if self._requeue_pod_lost(story_id, str(e), pod_ex):
-                            raise _HeadlessRequeued() from None
-                        if self._still_this_run(story_id, pod_ex):
-                            self._fail_infrastructure(
-                                story_id, f"worker pod lost mid-run: {e}"
-                            )
-                        raise _HeadlessAborted() from None
-                if outcome is None:
-                    outcome = await asyncio.to_thread(
-                        headless_exec.run_code_stage,
-                        story_id=story_id,
-                        worktree=workspace_path,
-                        prompt=prompt,
-                        config=config,
-                        on_event=on_stream,
-                    )
-            finally:
-                self._clear_watchdog_floor(story_id)
+                graph_on = self._code_graph_project(story_id)[1]
                 if graph_on:
-                    code_graph.cleanup(story_id)
+                    # the pod builds its own graph under /tmp; locally the graph
+                    # lives in the data dir. Never in the worktree.
+                    config.mcp_config = (
+                        code_graph.pod_mcp_config_json(pods.REPO_DIR)
+                        if use_pod
+                        else await self._graph_mcp(story_id, workspace_path)
+                    )
+                floor = config.timeout_seconds + (pods.EXEC_MARGIN + 300.0 if use_pod else 0.0)
+                self._set_watchdog_floor(story_id, floor)
+                try:
+                    outcome: headless_exec.HeadlessOutcome | None = None
+                    if use_pod:
+                        assert pod_ex is not None
+                        try:
+                            outcome = await asyncio.to_thread(
+                                pod_ex.run_headless,
+                                prompt,
+                                config,
+                                on_stream,
+                                workspace=workspace_path,
+                                project_root=project_root,
+                                commit_message=f"story {story_id}: coder output",
+                                on_artefacts=_artefact_note_writer(self, story_id),
+                            )
+                        except pods.PodUnavailable:
+                            outcome = None  # before the exec started: run locally
+                            if graph_on:
+                                config.mcp_config = await self._graph_mcp(
+                                    story_id, workspace_path
+                                )
+                        except pods.PodRunLost as e:
+                            # after it started: never rerun the round locally.
+                            # The first loss requeues the story, a second fails
+                            # it. After a cancel the endpoint marks the story
+                            # failed itself, so only abort.
+                            if self._requeue_pod_lost(story_id, str(e), pod_ex):
+                                raise _HeadlessRequeued() from None
+                            if self._still_this_run(story_id, pod_ex):
+                                self._fail_infrastructure(
+                                    story_id, f"worker pod lost mid-run: {e}"
+                                )
+                            raise _HeadlessAborted() from None
+                    if outcome is None:
+                        outcome = await asyncio.to_thread(
+                            headless_exec.run_code_stage,
+                            story_id=story_id,
+                            worktree=workspace_path,
+                            prompt=prompt,
+                            config=config,
+                            on_event=on_stream,
+                        )
+                finally:
+                    self._clear_watchdog_floor(story_id)
+                    if graph_on:
+                        code_graph.cleanup(story_id)
             with session_scope(self.engine) as db:
                 record_event(
                     db,
@@ -6125,20 +6321,24 @@ class StoryRunner:
             # watchdog, a healthy verify longer than WATCHDOG_TIMEOUT reads
             # as a hung stream and is killed mid-round. The verify carries
             # its own bound (`timeout`), so the floor is timeout + margin.
+            # One test slot for the whole run (in-process or in the worker
+            # pod), and no model slot: the story asks for one again only for
+            # a fix round, queueing behind everyone already waiting.
             await self._wait_for_train_ci(story_id)
-            self._set_watchdog_floor(story_id, timeout)
-            try:
-                rc, output = await asyncio.to_thread(
-                    _run_verify_command,
-                    workspace_path,
-                    command,
-                    timeout,
-                    project_root,
-                    story_id,
-                    self._executors.get(story_id),
-                )
-            finally:
-                self._clear_watchdog_floor(story_id)
+            async with self._test_slot(story_id):
+                self._set_watchdog_floor(story_id, timeout)
+                try:
+                    rc, output = await asyncio.to_thread(
+                        _run_verify_command,
+                        workspace_path,
+                        command,
+                        timeout,
+                        project_root,
+                        story_id,
+                        self._executors.get(story_id),
+                    )
+                finally:
+                    self._clear_watchdog_floor(story_id)
             counts = parse_summaries(output)
             mismatch = count_mismatch(rc, counts)
             passed = rc == 0 and not mismatch
@@ -7176,12 +7376,17 @@ class StoryRunner:
         extra = {"effort": effort} if effort is not None else {}
 
         async def gen() -> AsyncIterator[StreamEvent]:
-            async for event in self.gateway.stream_chat(
-                model=model, messages=messages, **extra
-            ):
-                if isinstance(event, Delta):
-                    bus.publish("story_log", {"story_id": story_id, "text": event.text})
-                yield event
+            # every reviewer call (AI review, code review chunks, reasons
+            # judgement, verdict retry) holds a model slot for its stream only
+            async with self._model_slot(story_id):
+                async for event in self.gateway.stream_chat(
+                    model=model, messages=messages, **extra
+                ):
+                    if isinstance(event, Delta):
+                        bus.publish(
+                            "story_log", {"story_id": story_id, "text": event.text}
+                        )
+                    yield event
 
         return gen()
 

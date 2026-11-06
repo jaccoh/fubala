@@ -298,6 +298,12 @@ class StoryOut(BaseModel):
         description="True once a human rejected this story at any gate; "
         "permanently disables both auto gates",
     )
+    slot_state: str | None = Field(
+        default=None,
+        description="In-memory slot state: working (holds a model slot), "
+        "waiting_tests (queued for or running verify), waiting_slot (queued "
+        "for a model slot), or null",
+    )
     verify_result: dict | None = Field(
         default=None, description="Verify stage outcome (passed/command/attempts/output)"
     )

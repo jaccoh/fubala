@@ -30,7 +30,12 @@ PROMPT_FILES = {
 
 DEFAULTS: dict[str, Any] = {
     "default_model": None,  # None = auto (cheapest keyed medium)
-    "max_parallel_stories": 2,
+    # concurrency is slots, not stories: at most model_slots LLM calls
+    # generating and test_slots verify runs at once; any number of stories
+    # may be in flight. max_parallel_stories is a deprecated alias of
+    # model_slots for one release (DEPRECATED_ALIASES below).
+    "model_slots": 2,
+    "test_slots": 2,
     "story_poll_interval": 0.5,
     "auto_approve_after_ai_review": False,
     "chat_system_prompt": None,
@@ -146,17 +151,36 @@ def set_api_token(engine: Engine, token: str | None) -> None:
         db.commit()
 
 
+# deprecated key -> the key it now reads and writes (kept for one release):
+# a stored value is read as the new key, a write to it writes the new key,
+# and the merged settings echo it with the new key's value
+DEPRECATED_ALIASES: dict[str, str] = {"max_parallel_stories": "model_slots"}
+
+
+def _with_aliases(merged: dict[str, Any]) -> dict[str, Any]:
+    return {**merged, **{old: merged[new] for old, new in DEPRECATED_ALIASES.items()}}
+
+
 def load_settings(engine: Engine) -> dict[str, Any]:
     with Session(engine) as db:
         row = db.get(AppSetting, SETTINGS_KEY)
         stored = json.loads(row.value) if row and row.value else {}
+    for old, new in DEPRECATED_ALIASES.items():
+        if old in stored and new not in stored:
+            stored[new] = stored[old]
     merged = {**DEFAULTS, **{k: v for k, v in stored.items() if k in DEFAULTS}}
-    return merged
+    return _with_aliases(merged)
 
 
 def save_settings(engine: Engine, partial: dict[str, Any]) -> dict[str, Any]:
+    partial = dict(partial)
+    for old, new in DEPRECATED_ALIASES.items():
+        if old in partial:
+            value = partial.pop(old)
+            partial.setdefault(new, value)
     current = load_settings(engine)
     merged = {**current, **{k: v for k, v in partial.items() if k in DEFAULTS}}
+    merged = {k: v for k, v in merged.items() if k in DEFAULTS}
     with Session(engine) as db:
         row = db.get(AppSetting, SETTINGS_KEY)
         if row is None:
@@ -164,7 +188,7 @@ def save_settings(engine: Engine, partial: dict[str, Any]) -> dict[str, Any]:
         row.value = json.dumps(merged)
         db.add(row)
         db.commit()
-    return merged
+    return _with_aliases(merged)
 
 
 def prompt_defaults() -> dict[str, str]:

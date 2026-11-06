@@ -91,3 +91,24 @@ def test_code_review_graph_pin_mismatch_is_reported():
     mutated = worker.replace(f"code-review-graph=={pin}", f"code-review-graph=={pin}.1")
     assert mutated != worker
     assert graph_pin_dockerfile(mutated) != graph_pin_pyproject(PYPROJECT.read_text())
+
+
+SMOKE = REPO / "docker" / "worker-smoke.sh"
+
+
+def test_worker_installs_code_review_graph_on_python_312():
+    line = next(
+        ln for ln in WORKER.read_text().splitlines() if "uv tool install code-review-graph==" in ln
+    )
+    assert "UV_PYTHON=3.12" in line or "--python 3.12" in line
+
+
+def test_worker_smoke_runs_code_review_graph():
+    assert "code-review-graph --version" in SMOKE.read_text()
+
+
+def test_worker_smoke_fails_when_compiler_present():
+    text = SMOKE.read_text()
+    assert "for compiler in cc gcc c++" in text
+    assert 'command -v "$compiler"' in text
+    assert "exit 1" in text

@@ -116,9 +116,13 @@ def test_reject_roundtrip_matches_rest(app_client):
 
 def test_settings_patch_roundtrip_matches_rest(app_client):
     patched = call_raw(
-        app_client, "patch_settings", {"values": {"max_parallel_stories": 3}, "by": "tester"}
+        app_client,
+        "patch_settings",
+        {"values": {"model_slots": 3, "test_slots": 1}, "by": "tester"},
     )
-    assert patched["max_parallel_stories"] == 3
+    assert patched["model_slots"] == 3
+    assert patched["test_slots"] == 1
+    assert patched["max_parallel_stories"] == 3  # deprecated alias
     assert app_client.get("/api/v1/settings").json() == patched
 
 
@@ -132,7 +136,7 @@ def test_destructive_tools_refuse_empty_by(app_client):
         ("delete_provider", {"provider_id": "x"}),
         ("delete_provider_model", {"provider_id": "x", "model_row_id": 1}),
         ("delete_chat_session", {"session_id": "x"}),
-        ("patch_settings", {"values": {"max_parallel_stories": 2}}),
+        ("patch_settings", {"values": {"model_slots": 2}}),
     ):
         assert "'by' is required" in call(app_client, name, {**args, "by": "  "}), name
     assert app_client.get(f"/api/v1/stories/{story['id']}").status_code == 200

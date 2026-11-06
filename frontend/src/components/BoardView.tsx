@@ -11,6 +11,7 @@ import type { ProviderLimit, Story } from "@/types";
 
 import { BudgetBadge } from "@/components/BudgetMeters";
 import { RunningToolBadge } from "@/components/RunningTool";
+import { SlotChip } from "@/components/story/LiveStrip";
 import { timeAgo } from "@/utils/timeAgo";
 import { parseServerTime } from "@/utils/parseServerTime";
 
@@ -121,6 +122,7 @@ function StoryCard({ story, blockedBy }: { story: Story; blockedBy: Story[] }) {
             claude
           </span>
         )}
+        <SlotChip slotState={story.slot_state} />
         {story.ai_verdict === "rejected" && (
           <span className="shrink-0 rounded bg-red-950/80 px-1 text-[10px] text-red-300">
             AI rejected

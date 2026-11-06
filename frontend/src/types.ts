@@ -105,6 +105,11 @@ export type ProjectDelivery = "merge" | "push";
 
 export type StoryKind = "code" | "info" | "prep";
 
+/** Where a story stands in the slot pools (in memory on the server):
+ *  working = holds a model slot, waiting_tests = queued for or running its
+ *  verify, waiting_slot = queued for a model slot. */
+export type SlotState = "working" | "waiting_tests" | "waiting_slot";
+
 export interface Story {
   id: string;
   title: string;
@@ -158,6 +163,8 @@ export interface Story {
   // from story_payload and may lack them, so every reader must guard null.
   queue_position?: number | null;
   waiting_behind?: number | null;
+  /** null when the story is in no slot pool (parked, queued, done, …) */
+  slot_state?: SlotState | null;
   /** open coder tool calls, oldest first; list/detail fetches only */
   running_tools?: RunningTool[];
 }
@@ -291,6 +298,11 @@ export interface StoryDetail extends Story {
 
 export interface AppSettings {
   default_model: string | null;
+  /** max LLM calls generating at once (any number of stories in flight) */
+  model_slots: number;
+  /** max verify runs at once */
+  test_slots: number;
+  /** @deprecated alias of model_slots, served for one release */
   max_parallel_stories: number;
   story_poll_interval: number;
   auto_approve_after_ai_review: boolean;

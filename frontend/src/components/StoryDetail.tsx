@@ -103,7 +103,12 @@ export function StoryDetail() {
       )}
 
         {/* live strip — fixed above the scrollable body, no scroll-away */}
-        <LiveStrip status={live.status} execution={live.execution} log={log} />
+        <LiveStrip
+          status={live.status}
+          execution={live.execution}
+          log={log}
+          slotState={live.slot_state}
+        />
 
         {/* body */}
         <StoryBody

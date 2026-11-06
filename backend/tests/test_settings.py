@@ -6,14 +6,18 @@ from conftest import MINIMAL_SPEC, PRODUCT_DEFAULTS, FakeGateway
 
 def test_settings_roundtrip_and_defaults(client):
     body = client.get("/api/v1/settings").json()
-    assert body["max_parallel_stories"] == 2
+    assert body["model_slots"] == 2
+    assert body["test_slots"] == 2
+    assert body["max_parallel_stories"] == 2  # deprecated alias of model_slots
     assert body["auto_approve_after_ai_review"] is False
     assert body["default_model"] is None
 
     body = client.patch(
         "/api/v1/settings",
-        json={"max_parallel_stories": 4, "chat_system_prompt": "You are blunt."},
+        json={"model_slots": 4, "test_slots": 1, "chat_system_prompt": "You are blunt."},
     ).json()
+    assert body["model_slots"] == 4
+    assert body["test_slots"] == 1
     assert body["max_parallel_stories"] == 4
     assert body["chat_system_prompt"] == "You are blunt."
 
@@ -121,7 +125,10 @@ def test_phase_settings_are_served_and_old_databases_get_the_defaults(client):
         db.merge(AppSetting(key=SETTINGS_KEY, value='{"max_parallel_stories": 3}'))
         db.commit()
     body = client.get("/api/v1/settings").json()
+    # the deprecated key is read as model_slots
+    assert body["model_slots"] == 3
     assert body["max_parallel_stories"] == 3
+    assert body["test_slots"] == 2
     for key in PHASE_KEYS:
         assert key in body
     assert body["spec_effort"] == "high"
@@ -205,3 +212,29 @@ def test_worker_resource_settings(client):
     assert reset.status_code == 200
     assert reset.json()["worker_cpu_request"] == "1500m"
     assert reset.json()["worker_memory_limit"] == "6Gi"
+
+
+def test_slot_settings_bounds_and_the_deprecated_alias(client):
+    for key in ("model_slots", "test_slots", "max_parallel_stories"):
+        assert client.patch("/api/v1/settings", json={key: 0}).status_code == 422
+        assert client.patch("/api/v1/settings", json={key: 17}).status_code == 422
+    # a PATCH to the old key writes model_slots
+    body = client.patch("/api/v1/settings", json={"max_parallel_stories": 5}).json()
+    assert body["model_slots"] == 5 and body["max_parallel_stories"] == 5
+    assert client.get("/api/v1/settings").json()["model_slots"] == 5
+    # the stored row carries the new key only
+    from sqlmodel import Session
+
+    from app.models import AppSetting
+    from app.settings_store import SETTINGS_KEY
+
+    with Session(client.app.state.engine) as db:
+        stored = db.get(AppSetting, SETTINGS_KEY).value
+    assert '"model_slots": 5' in stored and "max_parallel_stories" not in stored
+    # the new key wins over the alias in one body; null resets to the default
+    body = client.patch(
+        "/api/v1/settings", json={"model_slots": 3, "max_parallel_stories": 9}
+    ).json()
+    assert body["model_slots"] == 3
+    body = client.patch("/api/v1/settings", json={"model_slots": None, "test_slots": None}).json()
+    assert body["model_slots"] == 2 and body["test_slots"] == 2

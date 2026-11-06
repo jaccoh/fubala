@@ -16,4 +16,11 @@ echo "postgres bindir: $pgdir"
 "$pgdir/initdb" --version
 python3 -c "import ctypes; ctypes.CDLL('libpq.so.5')"
 test -w "$UV_PYTHON_INSTALL_DIR"
+code-review-graph --version
+for compiler in cc gcc c++; do
+    if command -v "$compiler" >/dev/null 2>&1; then
+        echo "worker image must not contain a C compiler, found: $compiler" >&2
+        exit 1
+    fi
+done
 echo "worker smoke ok: uid $(id -u)"

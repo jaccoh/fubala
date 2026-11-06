@@ -3,6 +3,8 @@
 # .gitea/workflows/worker-image.yaml. NODE_IMAGE, UV_IMAGE and the claude pin
 # must equal the runtime Dockerfile's, and the code-review-graph pin must equal
 # backend/pyproject.toml's [tool.fubala] (backend/tests/test_worker_image_parity.py).
+# code-review-graph is installed on Python 3.12 (UV_PYTHON=3.12): tree-sitter has
+# no cp315 aarch64 wheel and this image has no C compiler to build it.
 ARG NODE_IMAGE=node:24.22.1-bookworm-slim
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.13.6
 
@@ -23,7 +25,7 @@ RUN groupadd --gid 10003 fubala \
 USER 10003
 ENV HOME=/home/fubala
 RUN uv python install 3.12 3.15 \
- && UV_TOOL_DIR=/opt/uv-tools UV_TOOL_BIN_DIR=/opt/uv-tools/bin uv tool install code-review-graph==2.3.9 \
+ && UV_PYTHON=3.12 UV_TOOL_DIR=/opt/uv-tools UV_TOOL_BIN_DIR=/opt/uv-tools/bin uv tool install code-review-graph==2.3.9 \
  && npm_config_cache=/tmp/npm-build-cache npm install -g --prefix /opt/claude-code @anthropic-ai/claude-code@2.1.314 \
  && rm -rf /tmp/npm-build-cache
 USER root

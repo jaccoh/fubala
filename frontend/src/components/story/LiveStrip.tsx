@@ -1,4 +1,25 @@
-import type { StoryStatus } from "@/types";
+import type { SlotState, StoryStatus } from "@/types";
+
+/** Slot-state chip: label + colors, shared by the live strip and the board
+ *  card. */
+export const SLOT_STATES: Record<SlotState, { label: string; chip: string }> = {
+  working: { label: "working", chip: "bg-emerald-950/80 text-emerald-300" },
+  waiting_tests: { label: "waiting on tests", chip: "bg-amber-950/80 text-amber-300" },
+  waiting_slot: { label: "waiting on slot", chip: "bg-zinc-800 text-zinc-400" },
+};
+
+export function SlotChip({ slotState }: { slotState: SlotState | null | undefined }) {
+  const slot = slotState ? SLOT_STATES[slotState] : undefined;
+  if (!slot) return null;
+  return (
+    <span
+      className={`shrink-0 rounded px-1 text-[10px] ${slot.chip}`}
+      title="slot state: working = generating, waiting on tests = verify, waiting on slot = queued for a model slot"
+    >
+      {slot.label}
+    </span>
+  );
+}
 
 /**
  * Live-strip stage map: label + colors for the statuses where an agent is
@@ -44,10 +65,12 @@ export function LiveStrip({
   status,
   execution,
   log,
+  slotState,
 }: {
   status: StoryStatus;
   execution: string;
   log: string;
+  slotState?: SlotState | null;
 }) {
   if (status === "in_progress" && execution === "external") return null;
   const stage = LIVE_STAGES[status];
@@ -62,6 +85,7 @@ export function LiveStrip({
       <div className="flex items-center gap-2">
         <span className={`h-2 w-2 animate-pulse rounded-full ${stage.dot}`} />
         <span className={`text-xs font-medium ${stage.text}`}>{stage.label}</span>
+        <SlotChip slotState={slotState} />
         <span className="truncate font-mono text-[10px] text-zinc-600">live</span>
       </div>
       {tail.length > 0 && (

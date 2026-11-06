@@ -1411,8 +1411,10 @@ async def get_settings(raw: bool = False) -> str:
 @_tool
 async def patch_settings(values: dict, by: str, raw: bool = False) -> str:
     """Change runtime settings. `values` is the PATCH body (e.g.
-    {"max_parallel_stories": 2}); an explicit null resets a key to its
-    default. Requires `by`, the actor asking for it."""
+    {"model_slots": 2, "test_slots": 1}: at most model_slots LLM calls and
+    test_slots verify runs at once; max_parallel_stories is a deprecated alias
+    of model_slots); an explicit null resets a key to its default. Requires
+    `by`, the actor asking for it."""
     if refused := _by_refused("patch_settings", by, "settings"):
         return refused
     if not values:

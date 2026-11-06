@@ -40,6 +40,9 @@ PHASE_EFFORT_KEYS = ("spec_effort", "code_effort", "review_effort")
 
 class AppSettingsOut(BaseModel):
     default_model: str | None
+    model_slots: int
+    test_slots: int
+    # deprecated alias of model_slots (one release): same value
     max_parallel_stories: int
     story_poll_interval: float
     auto_approve_after_ai_review: bool
@@ -90,7 +93,15 @@ class AppSettingsOut(BaseModel):
 
 class AppSettingsUpdate(BaseModel):
     default_model: str | None = Field(default=None)
-    max_parallel_stories: int | None = Field(default=None, ge=1, le=16)
+    model_slots: int | None = Field(
+        default=None, ge=1, le=16, description="max LLM calls generating at once"
+    )
+    test_slots: int | None = Field(
+        default=None, ge=1, le=16, description="max verify runs at once"
+    )
+    max_parallel_stories: int | None = Field(
+        default=None, ge=1, le=16, description="deprecated alias of model_slots"
+    )
     story_poll_interval: float | None = Field(default=None, ge=0.05, le=60)
     auto_approve_after_ai_review: bool | None = None
     chat_system_prompt: str | None = None
@@ -225,6 +236,13 @@ def patch_settings(payload: AppSettingsUpdate, request: Request) -> AppSettingsO
         )
         for k, v in updates.items()
     }
+    # deprecated alias: a write to max_parallel_stories writes model_slots
+    alias = updates.pop("max_parallel_stories", None)
+    if alias is not None:
+        updates.setdefault("model_slots", alias)
+    for key in ("model_slots", "test_slots"):
+        if key in updates and updates[key] is None:
+            updates[key] = DEFAULTS[key]
     if "run_executor" in updates and updates["run_executor"] is None:
         updates["run_executor"] = DEFAULTS["run_executor"]
     if "worker_fallback_parallel" in updates and updates["worker_fallback_parallel"] is None:

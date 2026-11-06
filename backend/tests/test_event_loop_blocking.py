@@ -216,7 +216,7 @@ def test_train_sweep_runs_off_the_loop(client, monkeypatch):
     runner = _runner(client)
 
     async def scenario() -> int:
-        await runner._tick(max_parallel=0)
+        await runner._tick(model_slots=1)
         return threading.get_ident()
 
     loop_thread = asyncio.run(scenario())

@@ -15,6 +15,7 @@ import type {
   ProviderInfo,
   ProviderLimit,
   SessionInfo,
+  SlotState,
   Story,
   StoryActivityEvent,
   StoryDetail,
@@ -713,6 +714,18 @@ export const useStore = create<FubalaState>()((set, get) => ({
         const { [story.id]: _dropTools, ...restTools } = get().storyRunningTools;
         set({ storyProgress: rest, storyRunningTools: restTools });
       }
+    });
+    boardEvents.addEventListener("story_slot", (e) => {
+      // slot_state is in memory on the server and changes without a story
+      // write: patch it onto the card, never through upsertStory's
+      // updated_at guard
+      const { story_id, slot_state } = JSON.parse((e as MessageEvent).data) as {
+        story_id: string;
+        slot_state: SlotState | null;
+      };
+      set((st) => ({
+        stories: st.stories.map((s) => (s.id === story_id ? { ...s, slot_state } : s)),
+      }));
     });
     boardEvents.addEventListener("story_progress", (e) => {
       const { story_id, kind, data } = JSON.parse((e as MessageEvent).data) as {

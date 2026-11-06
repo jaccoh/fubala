@@ -279,12 +279,20 @@ export function AppSettingsPanel() {
           </label>
 
           <NumberField
-            label="Parallel stories"
-            value={settings.max_parallel_stories}
+            label="Model slots"
+            value={settings.model_slots}
             min={1}
             max={16}
-            hint="stories spec-generating at once"
-            onCommit={(v) => patch({ max_parallel_stories: v })}
+            hint="LLM calls generating at once; any number of stories in flight"
+            onCommit={(v) => patch({ model_slots: v })}
+          />
+          <NumberField
+            label="Test slots"
+            value={settings.test_slots}
+            min={1}
+            max={16}
+            hint="verify runs at once"
+            onCommit={(v) => patch({ test_slots: v })}
           />
           <NumberField
             label="Queue poll (s)"
