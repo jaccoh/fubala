@@ -198,6 +198,7 @@ interface FubalaState {
     execution?: "internal" | "external";
     gate_spec?: StoryGate;
     gate_code?: StoryGate;
+    priority?: "normal" | "urgent";
   }) => Promise<void>;
   deleteStory: (id: string) => Promise<void>;
   storyAction: (
@@ -288,6 +289,7 @@ interface FubalaState {
       train_max?: number;
       brief_token_budget?: number;
       brief_in_spec_prompt?: boolean;
+      code_graph_enabled?: boolean;
       pr_api_base?: string;
     pr_web_base?: string;
       pr_repo?: string;

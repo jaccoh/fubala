@@ -477,7 +477,12 @@ def test_mark_env_without_story_id_is_noop(monkeypatch) -> None:
     assert procs.mark_env({"A": "1"}, None) == {"A": "1"}
     # the None branch returns None only from a clean parent env; the suite
     # itself may run inside a marked verify tree, so scrub the markers first
-    for var in (procs.MARKER, procs.STORY_ID_VAR, procs.SPAWNER_PID_VAR):
+    for var in (
+        procs.MARKER,
+        procs.STORY_ID_VAR,
+        procs.SPAWNER_PID_VAR,
+        procs.RUN_ID_VAR,
+    ):
         monkeypatch.delenv(var, raising=False)
     assert procs.mark_env(None, None) is None
     # nested case: markers in the parent env are stripped, never inherited

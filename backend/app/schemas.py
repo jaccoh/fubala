@@ -5,7 +5,7 @@ from typing import Annotated
 
 from pydantic import AliasChoices, BaseModel, Field, PlainSerializer, field_validator
 
-from .models import StoryExecution, StoryGate, StoryKind
+from .models import StoryExecution, StoryGate, StoryKind, StoryPriority
 
 
 def as_utc_iso(dt: datetime) -> str:
@@ -156,6 +156,10 @@ class StoryCreate(BaseModel):
         description="Per-run tool-call budget for this story's coder; "
         "None = inherit the app's tools_max_calls setting",
     )
+    priority: str = Field(
+        default=StoryPriority.NORMAL,
+        description='"normal" (default) or "urgent" (queued ahead of all normal stories)',
+    )
     gate_spec: str | None = Field(
         default=None,
         description='"human" (default) = the operator approves the spec; '
@@ -176,8 +180,19 @@ class StoryCreate(BaseModel):
             raise ValueError(f"gate must be one of {list(StoryGate.ALL)}")
         return value
 
+    @field_validator("priority")
+    @classmethod
+    def _priority_must_be_known(cls, value: str | None) -> str | None:
+        if value is not None and value not in StoryPriority.ALL:
+            raise ValueError(f"priority must be one of {list(StoryPriority.ALL)}")
+        return value
+
 
 class StoryUpdate(BaseModel):
+    priority: str | None = Field(
+        default=None,
+        description="normal | urgent; changeable in any status except done",
+    )
     title: str | None = Field(default=None, min_length=1, max_length=200)
     description: str | None = Field(default=None, max_length=20_000)
     acceptance: str | None = Field(default=None, max_length=20_000)
@@ -217,6 +232,13 @@ class StoryUpdate(BaseModel):
             raise ValueError(f"gate must be one of {list(StoryGate.ALL)}")
         return value
 
+    @field_validator("priority")
+    @classmethod
+    def _priority_must_be_known(cls, value: str | None) -> str | None:
+        if value is not None and value not in StoryPriority.ALL:
+            raise ValueError(f"priority must be one of {list(StoryPriority.ALL)}")
+        return value
+
 
 class StoryOut(BaseModel):
     id: str
@@ -230,6 +252,7 @@ class StoryOut(BaseModel):
     model: str | None
     skill: str | None
     created_by: str
+    priority: str = StoryPriority.NORMAL
     execution: str = StoryExecution.INTERNAL
     execution_override: str | None = Field(
         default=None,

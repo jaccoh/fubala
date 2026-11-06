@@ -97,6 +97,14 @@ function StoryCard({ story, blockedBy }: { story: Story; blockedBy: Story[] }) {
         <span className="truncate font-mono">
           {story.model ?? `auto:${story.skill ?? "medium"}`}
         </span>
+        {story.priority === "urgent" && (
+          <span
+            className="shrink-0 rounded bg-red-950/80 px-1 text-[10px] font-semibold text-red-300"
+            title="urgent: picked up ahead of all normal stories"
+          >
+            urgent
+          </span>
+        )}
         {story.execution === "external" && (
           <span
             className="shrink-0 rounded bg-teal-950/80 px-1 text-[10px] text-teal-300"

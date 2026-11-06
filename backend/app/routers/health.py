@@ -50,7 +50,7 @@ def _stalled(request: Request, *, multiplier: float, floor: float) -> tuple[str 
 
 
 @router.get("/health", response_model=HealthOut)
-def health(request: Request) -> HealthOut:
+async def health(request: Request) -> HealthOut:
     """Process-serving probe: 200 as long as the process answers, whatever
     the scheduler is doing (self-update and the menu bar read non-200 as
     "down"; k8s readiness keeps the board on the ingress during a long tick).
@@ -69,7 +69,7 @@ def health(request: Request) -> HealthOut:
 
 
 @router.get("/health/live", response_model=HealthOut)
-def health_live(request: Request) -> HealthOut | Response:
+async def health_live(request: Request) -> HealthOut | Response:
     """Scheduler-liveness probe (the k8s livenessProbe target): 503 only when
     the last COMPLETED tick is older than max(600 s, 10x the poll interval) —
     a really dead loop, never a legitimately long tick."""
@@ -92,5 +92,5 @@ def health_live(request: Request) -> HealthOut | Response:
 
 
 @router.get("/version", response_model=VersionOut)
-def version() -> VersionOut:
+async def version() -> VersionOut:
     return VersionOut(version=__version__)

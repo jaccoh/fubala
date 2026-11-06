@@ -38,7 +38,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 
-from . import headless, procs, workspaces
+from . import code_graph, headless, procs, workspaces
 from .settings_store import DEFAULTS
 
 log = logging.getLogger(__name__)
@@ -62,6 +62,7 @@ CLAUDE_DIR = "/work/.claude"  # per-round CLAUDE_CONFIG_DIR: /work/.claude/<n>
 TRANSCRIPT_CAP = 50_000_000  # bytes of the session JSONL copied back
 CLOSE_TRANSCRIPT_TIMEOUT = 15.0  # transcript copy bound on cancel/kill
 BUNDLE_END = "END-FUBALA-BUNDLE"
+SPILL_BYTES = 64_000  # a CLI prompt over this goes through a file, not argv
 
 POD_ENV = {
     "HOME": "/cache/home",
@@ -1138,7 +1139,12 @@ class PodExecutor:
             n = self._exec_n
             config_dir = f"{CLAUDE_DIR}/{n}"
             env = headless.pod_child_env(config, config_dir)
-            frame = headless_frame(config.timeout_seconds, env, headless.child_argv(prompt, config))
+            child_argv = headless.child_argv(prompt, config)
+            if config.mcp_config:
+                # the graph is built inside the pod (data under /tmp, never in
+                # the repo) right before the CLI starts; fail open
+                child_argv = code_graph.pod_argv(child_argv, REPO_DIR)
+            frame = headless_frame(config.timeout_seconds, env, child_argv)
             argv = ["sh", "-c", HEADLESS_SCRIPT, "_", REPO_DIR, str(n)]
             stream = headless.StreamReader(literals, headless.safe_relay(on_event))
             lines = _LineBuffer(stream.feed)
@@ -1185,6 +1191,92 @@ class PodExecutor:
             if timed_out:
                 self._delete_pod()  # a later round gets a fresh pod
             return outcome
+
+    def _spill(self, path: str, data: bytes) -> None:
+        """Write `data` to `path` in the pod (an argv value past SPILL_BYTES
+        would hit the kernel's per-argument limit; stdin has none)."""
+        try:
+            rc, _out, err = self._exec(
+                ["sh", "-c", 'mkdir -p /work/.exec && cat > "$1"', "_", path],
+                data,
+                120.0,
+            )
+        except ExecTimeout as e:
+            raise self.fallback("spill", f"writing a prompt file timed out: {e}") from e
+        if rc != 0:
+            raise self.fallback("spill", f"writing a prompt file failed (rc {rc}): {err[-300:]}")
+
+    def _cli_argv(self, argv: list[str], prompt: str, n: int) -> list[str]:
+        """The CLI argv for a pod session: the prompt goes after -p (the
+        HEADLESS_SCRIPT child has stdin </dev/null). A prompt or system prompt
+        over SPILL_BYTES goes through a file instead (stdin redirect /
+        --system-prompt-file) because one argv entry is capped at 128 KiB."""
+        argv = list(argv)
+        if "--system-prompt" in argv:
+            i = argv.index("--system-prompt") + 1
+            system = argv[i].encode()
+            if len(system) > SPILL_BYTES:
+                path = f"/work/.exec/{n}.system"
+                self._spill(path, system)
+                argv[i - 1 : i + 1] = ["--system-prompt-file", path]
+        raw = prompt.encode()
+        if len(raw) <= SPILL_BYTES:
+            argv.insert(argv.index("-p") + 1, prompt)
+            return argv
+        path = f"/work/.exec/{n}.prompt"
+        self._spill(path, raw)
+        return ["sh", "-c", 'f=$1; shift; exec "$@" <"$f"', "_", path, *argv]
+
+    def run_cli_session(
+        self,
+        argv: list[str],
+        env: dict[str, str],
+        prompt: str,
+        timeout: float,
+        workspace: Path,
+    ) -> tuple[int, str, str]:
+        """One non-interactive `claude -p` session (spec phase, built by
+        claude_code.build_cli_session) in the pod, against a snapshot of
+        `workspace`. Read-only: nothing is committed or pulled back.
+
+        Returns (rc, stdout, stderr) redacted of the token; rc 124 when the
+        outer bound expired. PodUnavailable before the exec starts (the caller
+        runs the session locally); PodRunLost after it started."""
+        secret_keys = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN")
+        literals = tuple(v for k, v in env.items() if v and k in secret_keys)
+        with self._lock:
+            self.prepare()
+            if timeout + EXEC_MARGIN > pod_deadline(self.settings, self.mode):
+                raise self.fallback("deadline", "the session outlives the pod deadline")
+            self.sync_workspace(workspace)
+            self._exec_n += 1
+            n = self._exec_n
+            child = self._cli_argv(argv, prompt, n)
+            # ---- started: from here on no fallback, only PodRunLost
+            if "--mcp-config" in argv:
+                child = code_graph.pod_argv(child, REPO_DIR)
+            frame = headless_frame(
+                timeout, {**env, "CLAUDE_CONFIG_DIR": f"{CLAUDE_DIR}/{n}"}, child
+            )
+            exec_argv_ = ["sh", "-c", HEADLESS_SCRIPT, "_", REPO_DIR, str(n)]
+            self._in_exec = True
+            try:
+                try:
+                    rc, out, err = self._exec_started(
+                        exec_argv_, frame, timeout + EXEC_MARGIN, literals
+                    )
+                except ExecTimeout:
+                    warn_once("exec-timeout", "a CLI session outlived its bound")
+                    rc, out, err = 124, "", ""
+                    self.kill()
+                if self._closed:
+                    raise PodRunLost("the worker pod was closed mid-run")
+                self._reap("timeout" if rc == 124 else "round_end", literals)
+            finally:
+                self._in_exec = False
+            if rc == 124:
+                self._delete_pod()  # a later session gets a fresh pod
+        return rc, headless._redact(out, literals), headless._redact(err, literals)
 
     def kill(self) -> None:
         """Graceful in-pod kill of running execs (TERM, KILL after 10s)."""

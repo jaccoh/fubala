@@ -36,6 +36,15 @@ PR_MAX_ATTEMPTS = max(1, int(os.environ.get("FUBALA_PR_MAX_ATTEMPTS", "3")))
 PR_BACKOFF_BASE = max(0.0, float(os.environ.get("FUBALA_PR_BACKOFF_BASE", "1.0")))
 PR_RETRY_WINDOW = max(0.0, float(os.environ.get("FUBALA_PR_RETRY_WINDOW", "30.0")))
 
+# One shared socket timeout for every Gitea call (per socket operation).
+# Functions take `timeout=None` and resolve it at call time, so tests can
+# monkeypatch this value.
+PR_HTTP_TIMEOUT = float(os.environ.get("FUBALA_PR_TIMEOUT", "30"))
+
+
+def _timeout(timeout: float | None) -> float:
+    return PR_HTTP_TIMEOUT if timeout is None else timeout
+
 
 class PullRequestError(Exception):
     """User-presentable PR failure (message goes to story.error — must never
@@ -197,7 +206,7 @@ def create_pull(
     base_branch: str,
     title: str,
     body: str = "",
-    timeout: float = 30.0,
+    timeout: float | None = None,
 ) -> tuple[str | None, int]:
     """Open a pull request on a Gitea instance; returns (html_url, index).
 
@@ -229,7 +238,7 @@ def create_pull(
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with urllib.request.urlopen(request, timeout=_timeout(timeout)) as response:
                 raw = response.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             _raise_http_error(e, "POST", url)
@@ -290,7 +299,7 @@ def _request_json(
     token: str,
     *,
     method: str = "GET",
-    timeout: float = 30.0,
+    timeout: float | None = None,
     body: dict | None = None,
 ) -> Any:
     """Authed JSON request to the Gitea API.
@@ -312,7 +321,7 @@ def _request_json(
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, headers=headers, method=method, data=data)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=_timeout(timeout)) as response:
             raw = response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         _raise_http_error(e, method, url)
@@ -337,7 +346,7 @@ def get_pull(
     repo: str,
     token: str,
     index: int,
-    timeout: float = 30.0,
+    timeout: float | None = None,
 ) -> dict:
     """Fetch one pull request: {merged, mergeable, state, head_sha,
     merge_commit_sha, base_ref, merge_base}.
@@ -378,7 +387,7 @@ def find_open_pull(
     repo: str,
     token: str,
     head: str,
-    timeout: float = 30.0,
+    timeout: float | None = None,
 ) -> tuple[str, int] | None:
     """Find the open pull request whose head branch is `head`.
 
@@ -415,7 +424,7 @@ def pull_files(
     repo: str,
     token: str,
     index: int,
-    timeout: float = 30.0,
+    timeout: float | None = None,
 ) -> list[str]:
     """The changed file paths of a pull request (possibly truncated).
 
@@ -442,7 +451,7 @@ def update_branch(
     repo: str,
     token: str,
     index: int,
-    timeout: float = 30.0,
+    timeout: float | None = None,
 ) -> None:
     """Ask Gitea to update the PR's branch from its base (retry-land).
 
@@ -478,7 +487,7 @@ def find_latest_workflow_run(
     repo: str,
     token: str,
     head_sha: str,
-    timeout: float = 30.0,
+    timeout: float | None = None,
 ) -> int | None:
     """The id of the latest Actions run for `head_sha`, or None for "no run".
 
@@ -517,7 +526,7 @@ def rerun_workflow_run(
     repo: str,
     token: str,
     run_id: int,
-    timeout: float = 30.0,
+    timeout: float | None = None,
 ) -> None:
     """Re-run an Actions workflow run (Gitea answers 201).
 
@@ -540,7 +549,7 @@ def create_pull_comment(
     token: str,
     index: int,
     body: str,
-    timeout: float = 30.0,
+    timeout: float | None = None,
 ) -> None:
     """Post a comment on a pull request (also works on plain issues).
 
@@ -565,7 +574,7 @@ def create_pull_comment(
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with urllib.request.urlopen(request, timeout=_timeout(timeout)) as response:
                 response.read()
         except urllib.error.HTTPError as e:
             _raise_http_error(e, "POST", url)
@@ -582,7 +591,7 @@ def close_pull(
     repo: str,
     token: str,
     index: int,
-    timeout: float = 30.0,
+    timeout: float | None = None,
 ) -> None:
     """Close a pull request without merging it.
 
@@ -608,7 +617,7 @@ def close_pull(
             method="PATCH",
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with urllib.request.urlopen(request, timeout=_timeout(timeout)) as response:
                 response.read()
         except urllib.error.HTTPError as e:
             _raise_http_error(e, "PATCH", url)
@@ -628,7 +637,7 @@ def branch_head(
     repo: str,
     token: str,
     branch: str,
-    timeout: float = 30.0,
+    timeout: float | None = None,
 ) -> str | None:
     """The sha `branch` points at on the remote, or None when Gitea reports
     no such branch (never pushed, or deleted after a merge) — or when the
@@ -662,7 +671,7 @@ def branch_merged(
     base: str,
     *,
     pr_index: int | None = None,
-    timeout: float = 30.0,
+    timeout: float | None = None,
 ) -> tuple[bool, str | None]:
     """Is `head` already contained in `base`? -> (contained, merge_sha|None)
 
@@ -713,7 +722,7 @@ def combined_status(
     repo: str,
     token: str,
     sha: str,
-    timeout: float = 30.0,
+    timeout: float | None = None,
 ) -> str | None:
     """The combined commit status of `sha`: "success" | "failure" | … or None.
 
@@ -733,7 +742,7 @@ def all_statuses(
     repo: str,
     token: str,
     sha: str,
-    timeout: float = 30.0,
+    timeout: float | None = None,
 ) -> list:
     """The FULL per-context status list of `sha` (empty when Gitea has none).
 
@@ -775,7 +784,7 @@ def merge_pull(
     token: str,
     index: int,
     head_sha: str,
-    timeout: float = 30.0,
+    timeout: float | None = None,
     *,
     force: bool = False,
 ) -> None:
@@ -819,7 +828,7 @@ def required_contexts(
     repo: str,
     token: str,
     branch: str,
-    timeout: float = 30.0,
+    timeout: float | None = None,
 ) -> list[str] | None:
     """The status contexts branch protection requires, or None.
 
@@ -846,7 +855,7 @@ def compare_merge_base(
     token: str,
     base: str,
     head: str,
-    timeout: float = 30.0,
+    timeout: float | None = None,
 ) -> str | None:
     """The merge base of `base` and `head`, or None when the compare cannot
     serve one (unknown branch, deleted head, no merge_base in the payload).
@@ -875,7 +884,7 @@ def status_description(
     repo: str,
     token: str,
     sha: str,
-    timeout: float = 30.0,
+    timeout: float | None = None,
 ) -> str | None:
     """Human context for a failed combined status: the description of the
     first non-success entry, or the overall state when there is none."""
@@ -896,7 +905,7 @@ def delete_branch(
     repo: str,
     token: str,
     branch: str,
-    timeout: float = 30.0,
+    timeout: float | None = None,
 ) -> None:
     """Delete a branch on the remote. A 404 (already gone) is success.
 
@@ -914,7 +923,7 @@ def delete_branch(
 _LOG_TAIL_BYTES = 64 * 1024
 
 
-def _request_text(url: str, token: str, timeout: float = 30.0) -> str:
+def _request_text(url: str, token: str, timeout: float | None = None) -> str:
     """Authed GET returning the raw body as text (the logs endpoint is not JSON)."""
     request = urllib.request.Request(
         url,
@@ -922,7 +931,7 @@ def _request_text(url: str, token: str, timeout: float = 30.0) -> str:
         method="GET",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=_timeout(timeout)) as response:
             data = response.read()
     except urllib.error.HTTPError as e:
         _raise_http_error(e, "GET", url)
@@ -938,7 +947,7 @@ def failed_job_logs(
     repo: str,
     token: str,
     head_sha: str,
-    timeout: float = 30.0,
+    timeout: float | None = None,
 ) -> str | None:
     """The log tails (last 64 KiB each) of the failed jobs of the latest
     Actions run for `head_sha`.

@@ -32,6 +32,14 @@ def create_story(client, **body) -> dict:
     return res.json()
 
 
+def _reached(status: str | None, want: str) -> bool:
+    """`in_progress` means "the scheduler picked it up": a fast pipeline may
+    already have moved the story on by the time the waiter looks."""
+    if want == "in_progress":
+        return status not in (None, "draft", "queued")
+    return status == want
+
+
 async def _drain_until_status(
     queue: asyncio.Queue, story_id: str, want: str, timeout: float
 ):
@@ -50,7 +58,7 @@ async def _drain_until_status(
             if frame.get("kind") != "story":
                 continue
             story = frame.get("data", {}).get("story", {})
-            if story.get("id") == story_id and story.get("status") == want:
+            if story.get("id") == story_id and _reached(story.get("status"), want):
                 return story
     finally:
         bus.unsubscribe(queue)
@@ -63,7 +71,7 @@ def wait_for_status(client, story_id: str, want: str, timeout: float = 30.0) -> 
     queue = client.portal.call(bus.subscribe)
     # the transition may have fired before we subscribed (loaded runner)
     current = client.get(f"/api/v1/stories/{story_id}").json()
-    if current.get("status") == want:
+    if _reached(current.get("status"), want):
         client.portal.call(bus.unsubscribe, queue)
         return current
     payload = client.portal.call(_drain_until_status, queue, story_id, want, timeout)

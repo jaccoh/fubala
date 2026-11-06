@@ -140,3 +140,26 @@ coordinator**.
 | R6 | Network egress is least-privilege; workers cannot reach the API server | 12, 13 |
 | R7 | No orphaned pods: ownerReference, reaper and failure handling | 3, 9 |
 | R8 | Behaviour is opt-in and reversible; the in-process pipeline stays the default | 10 |
+
+## 15. API pod resources
+
+With `run_executor=pod` every Claude Code CLI session of the spec phase (the main session and
+its one corrective nudge) runs in a worker pod, next to the coder rounds and the verify runs. The
+API pod no longer spawns `claude` child processes for them: it only orchestrates (FastAPI, SQLite,
+git bundles, gateway HTTP). Out of scope, separate stories: the AI review and chat on claude-max
+still spawn `claude` in the API pod. A session falls back to a local child only when the pod is
+unavailable before the exec starts (`PodUnavailable`), so a pod problem is never a new way for a
+story to fail. A prompt over 64 kB goes through a file in the pod (one argv entry is capped at
+128 KiB by the kernel).
+
+Proposed API pod resources, **to be confirmed by the coordinator from `kubectl top` after
+deploy**:
+
+| | CPU | Memory |
+|---|-----|--------|
+| request | 500m | 1Gi |
+| limit | 2 | 2Gi |
+
+Reason: the request covers the steady orchestration load; the limit leaves room for the
+snapshot bundles and the in-process fallback sessions without letting the API pod crowd the ems
+on stor01. The homelab2 manifest change stays a coordinator step (Fubala does not deploy).

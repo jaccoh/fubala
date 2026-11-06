@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from . import procs
+from . import code_graph, procs
 from .guardrails import redact_secrets
 
 # The CLI binary invoked in headless mode. Tests put a fake `claude` script
@@ -136,6 +136,8 @@ class HeadlessOutcome:
     # time converted to UTC. Both None on a plain stderr rate limit.
     limit_note: str | None = None
     limit_reset_at: datetime | None = None
+    # A/B counter: mcp__code-review-graph__* tool uses in the session
+    graph_tool_calls: int = 0
 
 
 @dataclass
@@ -161,6 +163,9 @@ class HeadlessConfig:
     oauth: bool = False
     # --effort level for a Claude Max run; None or "" sends no flag
     effort: str | None = None
+    # inline JSON for --mcp-config (the code-review-graph server, see
+    # code_graph.mcp_config_json); None = no MCP flags at all
+    mcp_config: str | None = None
 
 
 def strip_provider_prefix(canonical: str) -> str:
@@ -187,6 +192,12 @@ def _child_env(config: HeadlessConfig) -> dict[str, str]:
     no provider keys other than the one we deliberately inject. The token
     exists only in this dict and the child's memory.
     """
+    env = _host_env()
+    env.update(_claude_env(config))
+    return env
+
+
+def _host_env() -> dict[str, str]:
     env = {
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
         "HOME": os.environ.get("HOME", str(Path.home())),
@@ -194,7 +205,6 @@ def _child_env(config: HeadlessConfig) -> dict[str, str]:
     tmpdir = os.environ.get("TMPDIR")
     if tmpdir:
         env["TMPDIR"] = tmpdir
-    env.update(_claude_env(config))
     return env
 
 
@@ -344,6 +354,8 @@ def child_argv(prompt: str, config: HeadlessConfig) -> list[str]:
     ]
     if config.oauth and config.effort:
         argv += ["--effort", config.effort]
+    if config.mcp_config:
+        argv += ["--mcp-config", config.mcp_config, "--strict-mcp-config"]
     return argv
 
 
@@ -740,6 +752,7 @@ def map_outcome(
         exit_code=exit_code,
         transcript_path=str(transcript_path) if transcript_path else None,
         permission_denials=denials,
+        graph_tool_calls=code_graph.count_graph_tool_calls(stream.events),
     )
 
 

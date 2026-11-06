@@ -145,6 +145,11 @@ class ProjectCreate(BaseModel):
         description="Send the brief's Owner rules and Non-goals sections (plus "
         "the story's epic description) to the spec writer (default off)",
     )
+    code_graph_enabled: bool | None = Field(
+        default=None,
+        description="code-review-graph: MCP server for CLI sessions and an "
+        "impact report at every code review (default off)",
+    )
 
     @field_validator("default_gate_spec", "default_gate_code")
     @classmethod
@@ -242,6 +247,11 @@ class ProjectUpdate(BaseModel):
         "(plus the story's epic description) to the spec writer; "
         "None = leave unchanged",
     )
+    code_graph_enabled: bool | None = Field(
+        default=None,
+        description="code-review-graph on or off for this project; "
+        "None = leave unchanged",
+    )
 
     @field_validator("default_gate_spec", "default_gate_code")
     @classmethod
@@ -295,6 +305,7 @@ def _project_out(db: Session, project: Project) -> dict:
         ),
         "brief_token_budget": brief_module.brief_budget(project),
         "brief_in_spec_prompt": bool(project.brief_in_spec_prompt),
+        "code_graph_enabled": bool(project.code_graph_enabled),
         "story_count": story_count,
         "root_exists": Path(project.root).exists(),
         "root_is_repo": (Path(project.root) / ".git").exists(),
@@ -394,6 +405,7 @@ def create_project(payload: ProjectCreate, request: Request) -> dict:
                 else brief_module.DEFAULT_BRIEF_TOKEN_BUDGET
             ),
             brief_in_spec_prompt=bool(payload.brief_in_spec_prompt),
+            code_graph_enabled=bool(payload.code_graph_enabled),
         )
         db.add(project)
         db.flush()
@@ -481,6 +493,8 @@ def update_project(project_id: str, payload: ProjectUpdate, request: Request) ->
             project.brief_token_budget = int(payload.brief_token_budget)
         if payload.brief_in_spec_prompt is not None:
             project.brief_in_spec_prompt = payload.brief_in_spec_prompt
+        if payload.code_graph_enabled is not None:
+            project.code_graph_enabled = payload.code_graph_enabled
         # The pr_* fields are nullable, and PATCH must be able to actually
         # clear them: an explicit `null` in the body unsets the column (a
         # project dropping its Gitea wiring — landing stories are then parked

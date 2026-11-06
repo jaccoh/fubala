@@ -361,6 +361,7 @@ def create_story(payload: StoryCreate, request: Request) -> StoryOut:
             epic_id=payload.epic_id,
             depends_on=json.dumps(payload.depends_on),
             max_tool_calls=payload.max_tool_calls,
+            priority=payload.priority,
             created_by="local",
         )
         db.add(story)
@@ -692,6 +693,26 @@ def update_story(story_id: str, payload: StoryUpdate, request: Request) -> Story
         changed = {
             field for field in payload.model_fields_set if getattr(payload, field) is not None
         }
+        if changed == {"priority"}:
+            # priority-only PATCH: any status except done, so an operator can
+            # mark a story that is already past the editable states
+            if story.status == StoryStatus.DONE:
+                raise HTTPException(
+                    status_code=409, detail="story is done; its priority cannot change"
+                )
+            previous_priority = story.priority
+            story.priority = payload.priority
+            return _commit_and_publish(
+                db,
+                story,
+                "note",
+                {
+                    "priority": True,
+                    "from": previous_priority,
+                    "to": story.priority,
+                    "by": "operator",
+                },
+            )
         if (
             story.status == StoryStatus.HUMAN_REVIEW
             and not story.base_ref
@@ -721,6 +742,8 @@ def update_story(story_id: str, payload: StoryUpdate, request: Request) -> Story
             )
         if payload.model is not None:
             story.model = _resolve_model_or_400(request, payload.model)
+        if payload.priority is not None:
+            story.priority = payload.priority
         for field in ("title", "description", "acceptance"):
             value = getattr(payload, field)
             if value is not None:

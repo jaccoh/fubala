@@ -12,6 +12,23 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 RUNTIME = REPO / "Dockerfile"
 WORKER = REPO / "docker" / "worker.Dockerfile"
+PYPROJECT = REPO / "backend" / "pyproject.toml"
+CODE_GRAPH = REPO / "backend" / "app" / "code_graph.py"
+
+
+def graph_pin_dockerfile(text: str) -> str | None:
+    m = re.search(r"uv tool install code-review-graph==([^\s'\"]+)", text)
+    return m.group(1) if m else None
+
+
+def graph_pin_pyproject(text: str) -> str | None:
+    m = re.search(r"^code-review-graph\s*=\s*[\"']([^\"']+)[\"']", text, re.M)
+    return m.group(1) if m else None
+
+
+def graph_pin_module(text: str) -> str | None:
+    m = re.search(r"^PIN = [\"']([^\"']+)[\"']", text, re.M)
+    return m.group(1) if m else None
 
 
 def parse_pins(text: str) -> dict[str, str | None]:
@@ -57,3 +74,20 @@ def test_worker_dockerfile_ends_with_user_10003():
         if ln.strip() and not ln.strip().startswith("#")
     ]
     assert lines[-1] == "USER 10003"
+
+
+def test_code_review_graph_pins_match_pyproject():
+    want = graph_pin_pyproject(PYPROJECT.read_text())
+    assert want, "pyproject.toml [tool.fubala] must pin code-review-graph"
+    assert graph_pin_dockerfile(WORKER.read_text()) == want
+    assert graph_pin_dockerfile(RUNTIME.read_text()) == want
+    assert graph_pin_module(CODE_GRAPH.read_text()) == want
+
+
+def test_code_review_graph_pin_mismatch_is_reported():
+    worker = WORKER.read_text()
+    pin = graph_pin_dockerfile(worker)
+    assert pin
+    mutated = worker.replace(f"code-review-graph=={pin}", f"code-review-graph=={pin}.1")
+    assert mutated != worker
+    assert graph_pin_dockerfile(mutated) != graph_pin_pyproject(PYPROJECT.read_text())

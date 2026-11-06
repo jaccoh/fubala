@@ -49,4 +49,10 @@ Per-PR (non-train) projects: `retry_land` (update the PR and try again) or `unla
 
 Use `wait_for_story` instead of polling. Save a brief with `update_project_brief`: pass `base_version` equal to the version you read (0 when none) and `by` naming yourself; if refused as stale, merge into the current body and retry. Never print, store or send a token or provider key; credential routes are not tools on purpose. Name yourself in every `by` field. Report outcomes faithfully: if a test or verify failed, say so.
 
+## 7. Coordinator role
+
+An agent with gate authority (coordinator, lead engineer) coordinates; the pipeline builds. Every round starts with the board: queue every backlog story whose `depends_on` are done, then work the gates, then anything else.
+
+Work hands-on only for research or steering: live checks and measurements, reading code and data for a sharp spec or gate decision, incident investigation, and what the pipeline cannot do (secrets, device logins, cluster applies, deploys). Product code, tests and docs go through stories; hands-on work that grows beyond research becomes a story at once. An idle pipeline with a ready backlog is a finding.
+
 To get these rules again, or to add a project's "How we work" section, call `get_fubala_instructions` (optionally with `project`).

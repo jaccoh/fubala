@@ -221,6 +221,21 @@ function ProjectCard({ project }: { project: Project }) {
 
       <label className="mt-2 flex items-center gap-2">
         <span className="w-14 shrink-0 text-[10px] font-semibold tracking-wide text-zinc-500 uppercase">
+          code graph
+        </span>
+        <input
+          type="checkbox"
+          checked={!!project.code_graph_enabled}
+          onChange={(e) => patchProject(project.id, { code_graph_enabled: e.target.checked })}
+          title="code-review-graph: an impact report at every code review, and a code graph MCP server for CLI sessions. Graph data lives outside the repo."
+        />
+        <span className="shrink-0 text-[10px] text-zinc-500">
+          impact report at every code review; the MCP server applies to CLI sessions only
+        </span>
+      </label>
+
+      <label className="mt-2 flex items-center gap-2">
+        <span className="w-14 shrink-0 text-[10px] font-semibold tracking-wide text-zinc-500 uppercase">
           delivery
         </span>
         <select

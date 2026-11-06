@@ -98,6 +98,7 @@ function makeStory(overrides: Partial<Story> = {}): Story {
     execution_override: null,
     gate_spec: "human",
     gate_code: "human",
+    priority: "normal",
     human_rejected: false,
     kind: "code",
     claimed_by: null,

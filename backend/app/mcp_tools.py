@@ -196,6 +196,10 @@ def _story_summary(story: dict) -> str:
         )
         + (f" (claimed by {story['claimed_by']})" if story.get("claimed_by") else ""),
         f"- depends_on: {', '.join(deps) if deps else '-'}",
+    ]
+    if story.get("priority") == "urgent":
+        lines.append("- priority: urgent")
+    lines += [
         f"- spec: v{story.get('spec_version', 0)}"
         + (f", AI verdict: {story['ai_verdict']}" if story.get("ai_verdict") else ""),
         f"- gates: spec={story.get('gate_spec') or 'human'}"
@@ -433,6 +437,7 @@ async def create_story(
     project: str | None = None,
     gate_spec: str | None = None,
     gate_code: str | None = None,
+    priority: str | None = None,
     raw: bool = False,
 ) -> str:
     """File a new story on the board (lands in backlog). Provide EITHER a
@@ -451,6 +456,8 @@ async def create_story(
     rejection ever recorded for this story; any failed check parks the story
     at the human gate with the failed checks named in a note). Omit = the
     project's default_gate_spec / default_gate_code, else "human".
+    priority is "normal" (default) or "urgent": queued urgent stories are
+    picked up ahead of all normal ones, first-in first-out among themselves.
     project chooses the workspace the story runs in: a project id, an id
     prefix of >=8 characters, or a project name exactly as list_projects
     shows it (case-insensitive when unambiguous). Omitting project keeps the
@@ -479,6 +486,8 @@ async def create_story(
         body["gate_spec"] = gate_spec
     if gate_code:
         body["gate_code"] = gate_code
+    if priority:
+        body["priority"] = priority
     try:
         resolved = await _resolve_project(project)
     except (RuntimeError, ValueError) as e:
@@ -502,6 +511,7 @@ async def update_story(
     acceptance: str | None = None,
     gate_spec: str | None = None,
     gate_code: str | None = None,
+    priority: str | None = None,
     raw: bool = False,
 ) -> str:
     """Edit a story's editable fields. Mirrors the REST PATCH: only
@@ -509,7 +519,8 @@ async def update_story(
     accept "human" | "auto" (422 on any other value). Any argument left at
     None sends no key at all, so untouched fields keep their stored value.
     The gate fields can never clear `human_rejected`: a story a human
-    rejected is parked at the human gate for good."""
+    rejected is parked at the human gate for good. priority ("normal" |
+    "urgent") may be changed alone in any status except done."""
     body: dict = {}
     if title is not None:
         body["title"] = title
@@ -521,6 +532,8 @@ async def update_story(
         body["gate_spec"] = gate_spec
     if gate_code is not None:
         body["gate_code"] = gate_code
+    if priority is not None:
+        body["priority"] = priority
     if not body:
         return "nothing to update — pass at least one field"
     try:
@@ -1122,7 +1135,8 @@ async def update_project(project_id: str, fields: dict, raw: bool = False) -> st
     auto_max_diff_lines, merge_train, train_window_s, train_max,
     brief_token_budget (>= 1), brief_in_spec_prompt (send only the brief's
     Owner rules and Non-goals, plus the epic description, to the spec
-    writer)."""
+    writer), code_graph_enabled (code-review-graph: an MCP server for CLI
+    sessions plus an impact report at every code review)."""
     if not fields:
         return "nothing to update — pass at least one field"
     data, err = await _call("PATCH", f"/projects/{project_id}", fields, "update project failed")

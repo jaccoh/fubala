@@ -43,6 +43,7 @@ function makeStory(overrides: Partial<Story> = {}): Story {
     // gates: human by default, exactly what the API stamps at create
     gate_spec: "human",
     gate_code: "human",
+    priority: "normal",
     human_rejected: false,
     kind: "code",
     claimed_by: null,

@@ -250,6 +250,40 @@ def test_instructions_tool_without_project_covers_the_six_rules(app_client):
         assert phrase in text
 
 
+def test_coordinator_role_section_is_served_and_defined_once(app_client):
+    res = rpc(
+        app_client,
+        "initialize",
+        {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "t", "version": "0"},
+        },
+    )
+    init_text = body_of(res)["result"]["instructions"]
+    tool_text = call(app_client, "get_fubala_instructions", {})
+    for text in (init_text, tool_text):
+        for phrase in (
+            "## 7. Coordinator role",
+            "`depends_on`",
+            "research or steering",
+            "idle pipeline",
+        ):
+            assert phrase in text
+    assert approx_tokens(_base()) <= INSTRUCTIONS_TOKEN_BUDGET
+
+    sentence = "An idle pipeline with a ready backlog is a finding."
+    root = INSTRUCTIONS_PATH.parent.parent
+    files = [
+        f
+        for pattern in ("backend/app/**/*.py", "backend/prompts/**/*", "docs/**/*")
+        for f in root.glob(pattern)
+        if f.is_file()
+    ]
+    hits = {f: f.read_text(errors="ignore").count(sentence) for f in files}
+    assert {f: n for f, n in hits.items() if n} == {INSTRUCTIONS_PATH: 1}
+
+
 def test_instructions_tool_appends_how_we_work(app_client, tmp_path):
     project = _project_with_brief(
         app_client,

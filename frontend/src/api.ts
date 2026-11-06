@@ -136,6 +136,7 @@ export const api = {
     kind?: string;
     gate_spec?: StoryGate;
     gate_code?: StoryGate;
+    priority?: "normal" | "urgent";
   }) =>
     req<Story>("/stories", {
       method: "POST",
@@ -175,6 +176,7 @@ export const api = {
     /** Gate mode switches; only editable while the story is editable. */
     gate_spec?: StoryGate;
     gate_code?: StoryGate;
+    priority?: "normal" | "urgent";
   }) =>
     req<Story>(`/stories/${id}`, {
       method: "PATCH",
@@ -268,6 +270,7 @@ export const api = {
       train_max?: number;
       brief_token_budget?: number;
       brief_in_spec_prompt?: boolean;
+      code_graph_enabled?: boolean;
       pr_api_base?: string;
     pr_web_base?: string;
       pr_repo?: string;

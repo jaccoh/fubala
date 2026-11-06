@@ -123,6 +123,14 @@ def headless_assignment(story_id: str, share: float) -> bool:
     return (bucket / 1000) < share
 
 
+class StoryPriority:
+    """Queue priority: urgent stories go ahead of all normal ones."""
+
+    NORMAL = "normal"
+    URGENT = "urgent"
+    ALL = (NORMAL, URGENT)
+
+
 class StoryGate:
     """Who may pass a gate: a human, or the machine checks only.
 
@@ -186,6 +194,11 @@ class Story(SQLModel, table=True):
     queued_at: datetime | None = Field(
         default=None,
         description="When the story last entered queued; fairness clock for the scheduler",
+    )
+    priority: str = Field(
+        default=StoryPriority.NORMAL,
+        sa_column_kwargs={"server_default": StoryPriority.NORMAL},
+        description="normal | urgent; urgent queued stories are picked up first",
     )
     created_by: str = Field(default="local", description="Client identity; tokens in phase 3")
     execution: str | None = Field(
@@ -612,6 +625,12 @@ class Project(SQLModel, table=True):
     brief_in_spec_prompt: bool | None = Field(
         default=False,
         description="Send the brief's Owner rules and Non-goals to the spec writer",
+    )
+    # NULL = off. On: CLI sessions get a code-review-graph MCP server for the
+    # story workspace and every code review gets an impact report.
+    code_graph_enabled: bool | None = Field(
+        default=None,
+        description="code-review-graph for this project's stories (NULL = off)",
     )
 
     created_at: datetime = Field(default_factory=utcnow)

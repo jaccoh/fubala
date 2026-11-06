@@ -127,6 +127,8 @@ export interface Story {
   gate_spec: StoryGate;
   /** Who decides at the CODE gate (after verify + AI code review). */
   gate_code: StoryGate;
+  /** Queue priority; urgent queued stories are picked up ahead of normal ones. */
+  priority: "normal" | "urgent";
   /** True once a human rejected this story at any gate; permanently disables
    *  both auto gates. Never cleared by any write path. */
   human_rejected: boolean;
@@ -383,6 +385,9 @@ export interface Project {
   /** Send only the brief's Owner rules and Non-goals (plus the story's epic
    *  description) to the spec writer. Off by default. */
   brief_in_spec_prompt: boolean;
+  /** code-review-graph: an MCP server for CLI sessions plus an impact report
+   *  at every code review. Off by default. */
+  code_graph_enabled: boolean;
   story_count: number;
   root_exists: boolean;
   root_is_repo: boolean;

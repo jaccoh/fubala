@@ -152,6 +152,9 @@ def _running(client, story_id: str) -> tuple[list, list]:
 
 
 def test_running_tools_open_calls_oldest_first(client):
+    # scheduler hard-off: an `executing` row with a spec is a restart orphan the
+    # live scheduler would resume, racing the events this test seeds
+    client.portal.call(client.app.state.story_runner.stop)
     story = create_story(client)
     sid = story["id"]
     _set_status(client, sid, "executing")

@@ -212,6 +212,9 @@ Guardrails specific to external stories:
   `approve_story` / `reject_story`), so an agent can read the spec, the
   verify output and the diff and pass or reject the gate. Its reject reason
   reaches the next run, and its name is stamped in `approved_by`.
+  Such an agent follows the "Coordinator role" in the working rules
+  (`docs/mcp-instructions.md`, served via MCP): it coordinates and keeps the
+  pipeline full, and is hands-on only for research and steering.
 - **The scheduler lives in the server** (never the UI), so stories run headless
   with no browser open. Parallelism: `FUBALA_MAX_PARALLEL_STORIES` (default 2).
 - **Prompts are data**: `backend/prompts/spec_writer.md` and

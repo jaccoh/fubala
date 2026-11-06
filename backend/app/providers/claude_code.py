@@ -24,6 +24,7 @@ import tempfile
 from collections.abc import AsyncIterator
 from typing import Any
 
+from .. import code_graph
 from .. import headless as hx
 from ..registry import ResolvedModel
 from .gateway import Delta, GatewayError, StreamEvent, Usage
@@ -118,6 +119,85 @@ def _fail(provider_id: str, text: str, token: str) -> GatewayError:
     return GatewayError(f"[{provider_id}] claude CLI error: {text}")
 
 
+def build_cli_session(
+    resolved: ResolvedModel,
+    key: str | None,
+    messages: list[dict],
+    *,
+    cli_tools: str,
+    max_turns: int | None = None,
+    max_output_tokens: int | None = None,
+    effort: str | None = None,
+    mcp_config: str | None = None,
+) -> tuple[list[str], dict[str, str], str]:
+    """Pure: (argv, env, prompt) of one `claude -p` session. `cli_tools` is
+    the --tools value ("" = no tools); `effort` is the --effort level, no flag
+    when empty; `mcp_config` is inline JSON for --mcp-config (only that server,
+    its tools allowed). The env holds the Claude Code variables only (no
+    PATH/HOME/CLAUDE_CONFIG_DIR: the runner of the session adds its own); the
+    prompt is not in argv (stdin locally, argv after -p in a worker pod)."""
+    provider = resolved.provider
+    if not key:
+        raise GatewayError(f"[{provider.id}] missing credentials: no OAuth token set")
+    system, prompt = _flatten(messages)
+    config = hx.HeadlessConfig(
+        base_url=None, api_key=key, model=resolved.canonical,
+        small_fast_model=resolved.canonical, oauth=True,
+    )
+    env = hx._claude_env(config)
+    if max_output_tokens:
+        env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_output_tokens)
+    argv = [
+        hx.CLAUDE_BIN, "-p", "--output-format", "json",
+        "--model", resolved.model_id, "--tools", cli_tools, "--no-session-persistence",
+    ]
+    if effort:
+        argv += ["--effort", effort]
+    if max_turns:
+        argv += ["--max-turns", str(max_turns)]
+    if mcp_config:
+        argv += [
+            "--mcp-config", mcp_config, "--strict-mcp-config",
+            "--allowedTools", code_graph.ALLOWED_TOOLS,
+        ]
+    if system:
+        argv += ["--system-prompt", system]
+    return argv, env, prompt
+
+
+def parse_cli_result(
+    provider_id: str, key: str, rc: int, stdout: bytes | str, stderr: bytes | str
+) -> tuple[str, Usage]:
+    """Pure: the finished session's (rc, stdout, stderr) -> (result text,
+    usage), or GatewayError (limit markers map to `rate limit`); every string
+    is redacted of the token."""
+    out = stdout.encode() if isinstance(stdout, str) else stdout
+    err = stderr.encode() if isinstance(stderr, str) else stderr
+    data = _parse(out)
+    if data is None or data.get("is_error") or rc != 0:
+        text = str((data or {}).get("result") or "")
+        if not text:
+            text = (err or out).decode("utf-8", "replace")[-RESULT_CAP:] or f"exit code {rc}"
+        raise _fail(provider_id, text, key)
+    text = data.get("result")
+    if not isinstance(text, str) or not text.strip():
+        raise GatewayError(
+            f"[{provider_id}] claude CLI returned an empty result "
+            f"({data.get('subtype') or 'no subtype'})"
+        )
+    usage = data.get("usage") or {}
+    prompt_tokens = sum(
+        int(usage.get(k) or 0)
+        for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+    )
+    stop = data.get("stop_reason")
+    return _redact(text, key), Usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=int(usage.get("output_tokens") or 0),
+        finish_reason="length" if stop in ("max_tokens", "length") else "stop",
+    )
+
+
 async def _run_cli(
     resolved: ResolvedModel,
     key: str | None,
@@ -129,31 +209,17 @@ async def _run_cli(
     max_output_tokens: int | None = None,
     timeout: float = CLI_TIMEOUT_SECONDS,
     effort: str | None = None,
+    mcp_config: str | None = None,
 ) -> tuple[str, Usage]:
-    """One `claude -p` session; returns (result text, usage) or raises
-    GatewayError. `cli_tools` is the --tools value ("" = no tools); `effort`
-    is the --effort level, no flag when empty."""
+    """One local `claude -p` session; returns (result text, usage) or raises
+    GatewayError."""
     provider = resolved.provider
-    if not key:
-        raise GatewayError(f"[{provider.id}] missing credentials: no OAuth token set")
-    system, prompt = _flatten(messages)
-    config = hx.HeadlessConfig(
-        base_url=None, api_key=key, model=resolved.canonical,
-        small_fast_model=resolved.canonical, oauth=True,
+    argv, claude_env, prompt = build_cli_session(
+        resolved, key, messages, cli_tools=cli_tools, max_turns=max_turns,
+        max_output_tokens=max_output_tokens, effort=effort, mcp_config=mcp_config,
     )
-    env = hx._child_env(config)
-    if max_output_tokens:
-        env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_output_tokens)
-    argv = [
-        hx.CLAUDE_BIN, "-p", "--output-format", "json",
-        "--model", resolved.model_id, "--tools", cli_tools, "--no-session-persistence",
-    ]
-    if effort:
-        argv += ["--effort", effort]
-    if max_turns:
-        argv += ["--max-turns", str(max_turns)]
-    if system:
-        argv += ["--system-prompt", system]
+    assert key  # build_cli_session raised otherwise
+    env = {**hx._host_env(), **claude_env}
     # a scratch config dir (no host settings or session); the cwd is the
     # scratch dir too unless an agent phase needs the story's worktree
     workdir = tempfile.mkdtemp(prefix="fubala-claude-code-")
@@ -170,30 +236,7 @@ async def _run_cli(
         ) from e
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
-
-    data = _parse(out)
-    if data is None or data.get("is_error") or rc != 0:
-        text = str((data or {}).get("result") or "")
-        if not text:
-            text = (err or out).decode("utf-8", "replace")[-RESULT_CAP:] or f"exit code {rc}"
-        raise _fail(provider.id, text, key)
-    text = data.get("result")
-    if not isinstance(text, str) or not text.strip():
-        raise GatewayError(
-            f"[{provider.id}] claude CLI returned an empty result "
-            f"({data.get('subtype') or 'no subtype'})"
-        )
-    usage = data.get("usage") or {}
-    prompt_tokens = sum(
-        int(usage.get(k) or 0)
-        for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
-    )
-    stop = data.get("stop_reason")
-    return _redact(text, key), Usage(
-        prompt_tokens=prompt_tokens,
-        completion_tokens=int(usage.get("output_tokens") or 0),
-        finish_reason="length" if stop in ("max_tokens", "length") else "stop",
-    )
+    return parse_cli_result(provider.id, key, rc, out, err)
 
 
 async def stream_claude_code(
@@ -235,6 +278,7 @@ async def run_cli_agent(
     max_output_tokens: int | None = None,
     timeout: float = CLI_TIMEOUT_SECONDS,
     effort: str | None = None,
+    mcp_config: str | None = None,
 ) -> tuple[str, Usage]:
     """A tool phase (spec) as ONE Claude Code agent session in `cwd` with the
     built-in tools instead of Fubala's tool loop. The final result text is
@@ -242,5 +286,5 @@ async def run_cli_agent(
     return await _run_cli(
         resolved, key, messages, cli_tools=cli_tools, cwd=cwd,
         max_turns=max_turns, max_output_tokens=max_output_tokens, timeout=timeout,
-        effort=effort,
+        effort=effort, mcp_config=mcp_config,
     )

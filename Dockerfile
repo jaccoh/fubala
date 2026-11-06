@@ -110,7 +110,13 @@ RUN mkdir -p /opt/claude-code /data/home /data/cache \
  && su -s /bin/sh fubala -c \
       'npm_config_cache=/tmp/npm-build-cache npm install -g --prefix /opt/claude-code @anthropic-ai/claude-code@2.1.314 \
        && rm -rf /tmp/npm-build-cache && /opt/claude-code/bin/claude --version'
-ENV PATH=/opt/claude-code/bin:$PATH DISABLE_AUTOUPDATER=1
+# code-review-graph (story code graph, app/code_graph.py) in its OWN env: it needs
+# mcp<2 while the backend runs mcp 2. PIN: backend/pyproject.toml [tool.fubala].
+RUN mkdir -p /opt/uv-tools && chown 10003:10003 /opt/uv-tools \
+ && su -s /bin/sh fubala -c \
+      'UV_TOOL_DIR=/opt/uv-tools UV_TOOL_BIN_DIR=/opt/uv-tools/bin uv tool install code-review-graph==2.3.9 \
+       && /opt/uv-tools/bin/code-review-graph --version'
+ENV PATH=/opt/claude-code/bin:/opt/uv-tools/bin:$PATH DISABLE_AUTOUPDATER=1
 COPY --from=test /tests-passed /tests-passed
 COPY --from=frontend /src/frontend/dist /app/frontend/dist
 COPY docker/entrypoint.sh /usr/local/bin/fubala-entrypoint

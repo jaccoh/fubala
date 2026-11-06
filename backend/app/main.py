@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
@@ -16,6 +17,7 @@ from . import __version__
 from .auth import authorized
 from .config import Settings, get_settings
 from .db import init_db, make_engine
+from .looplag import watch_loop_lag
 from .mcp_tools import build_mcp_server, streamable_http_asgi
 from .providers import LiteLLMGateway, ProviderGateway
 from .registry import ProviderRegistry
@@ -153,11 +155,13 @@ def create_app(
         runner = StoryRunner(engine, app.state.gateway, registry=registry)
         app.state.story_runner = runner
         await runner.start()
+        lag_task = asyncio.create_task(watch_loop_lag())
         try:
             # the MCP session manager must stay open for the whole app lifespan
             async with app.state.mcp_session_manager.run():
                 yield
         finally:
+            lag_task.cancel()
             await runner.stop()
 
     app = FastAPI(title="Fubala", version=__version__, lifespan=lifespan)
@@ -251,6 +255,11 @@ def _migrate(engine) -> None:
         # legacy rows — the comparator falls back to updated_at)
         if "queued_at" not in story_cols:
             conn.execute(text("ALTER TABLE stories ADD COLUMN queued_at DATETIME"))
+        # queue priority (normal|urgent); legacy rows read the default
+        if "priority" not in story_cols:
+            conn.execute(
+                text("ALTER TABLE stories ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'")
+            )
         # v0.4: execution stage — worktree base commit
         if "base_ref" not in story_cols:
             conn.execute(text("ALTER TABLE stories ADD COLUMN base_ref TEXT"))
@@ -467,6 +476,11 @@ def _migrate(engine) -> None:
             conn.execute(
                 text("ALTER TABLE projects ADD COLUMN brief_in_spec_prompt BOOLEAN")
             )
+        # code graph (MCP + impact report): additive, NULL = off
+        if "code_graph_enabled" not in project_cols:
+            conn.execute(
+                text("ALTER TABLE projects ADD COLUMN code_graph_enabled BOOLEAN")
+            )
         # v0.17: the flush-time base of a batch. The done gate compares each
         # member's pushed_sha against it to tell "the member's own commit is
         # in main" from "the branch added nothing" (the empty-land incident).
@@ -516,7 +530,7 @@ def _rebuild_stories(engine) -> None:
     # have just received it via ALTER above, so it is always present here
     wanted = [
         "id", "title", "description", "acceptance", "status", "model", "skill",
-        "queued_at", "created_by", "execution", "gate_spec", "gate_code",
+        "queued_at", "priority", "created_by", "execution", "gate_spec", "gate_code",
         "human_rejected", "kind", "claimed_by", "claimed_at", "spec",
         "spec_version", "spec_rejects", "spec_history", "base_ref", "code_reject_head",
         "verify_result", "evidence", "max_tool_calls", "ai_review",
@@ -537,6 +551,7 @@ def _rebuild_stories(engine) -> None:
             model VARCHAR,
             skill VARCHAR,
             queued_at DATETIME,
+            priority VARCHAR NOT NULL DEFAULT 'normal',
             created_by VARCHAR NOT NULL,
             execution VARCHAR,
             gate_spec VARCHAR,

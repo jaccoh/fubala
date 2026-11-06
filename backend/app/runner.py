@@ -19,6 +19,7 @@ import subprocess
 import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatch
@@ -29,8 +30,8 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, or_, select
 
+from . import code_graph, pods, procs, workspaces
 from . import headless as headless_exec
-from . import pods, procs, workspaces
 from .agent import AgentResult, run_agent, strip_placeholders, tool_log_line
 from .agent_tools import ToolBox
 from .brief import spec_prompt_block
@@ -48,12 +49,14 @@ from .models import (
     StoryGate,
     StoryKind,
     StoryNote,
+    StoryPriority,
     StoryStatus,
     effective_execution,
     headless_assignment,
     utcnow,
 )
 from .providers import Delta, GatewayError, ProviderGateway, StreamEvent
+from .providers.claude_code import READ_ONLY_CLI_TOOLS
 from .registry import ProviderRegistry, UnknownModelError, limit_reset_zone
 from .schemas import as_utc_iso
 from .settings_store import DEFAULTS, effective_prompt, load_settings
@@ -105,6 +108,13 @@ RATE_LIMIT_MARKERS = ("rate_limit", "ratelimit", "rate limit", "1302")
 LAND_POLL_MIN_INTERVAL = float(
     os.environ.get("FUBALA_LAND_POLL_MIN_INTERVAL", "15.0")
 )
+
+# Wall-clock caps for the Gitea/git sweeps that run off the event loop. Their
+# sum (480 s) stays under SCHEDULER_LIVE_STALL_GRACE_SECONDS (600 s), so a long
+# tick can never trip /health/live. A capped sweep is retried on a later tick.
+LAND_SWEEP_CAP = 90.0
+RECONCILE_SWEEP_CAP = 90.0
+TRAIN_SWEEP_CAP = 300.0
 
 # land_state marker for "mergeable was False, first seen at <timestamp>" —
 # a conflict is only declared after TWO consecutive False observations that
@@ -1092,20 +1102,26 @@ STARVATION_S = 900  # 15 minutes: max time any queued story waits behind cheaper
 SKILL_COST_RANK = {"low": 0, "medium": 1, "high": 2}
 
 
-def fair_order_key(story: Story, now: datetime) -> tuple[int, int, float, str]:
+def fair_order_key(story: Story, now: datetime) -> tuple[int, int, int, float, str]:
     """Sort key for queued stories: the scheduler picks the smallest key.
 
-    Rank 0 = starved (waited >= STARVATION_S), rank 1 = fresh; within a rank
-    the cheaper skill tier goes first, then the longer wait, then story id so
-    the order is deterministic. Pure: no DB, no clock reads — callers pass
-    `now`, which makes the key directly unit-testable and lets the API
+    The first element is the priority rank: urgent stories (0) go ahead of
+    every normal one (1; NULL counts as normal), first-in first-out by wait
+    then id, with the skill tier ignored. Urgent deliberately outranks the
+    starvation bound, so a steady stream of urgent stories can starve normal
+    work. Among normal stories: rank 0 = starved (waited >= STARVATION_S),
+    rank 1 = fresh; within a rank the cheaper skill tier goes first, then the
+    longer wait, then story id so the order is deterministic. Pure: no DB, no
+    clock reads — callers pass `now`, which makes the key directly unit-testable and lets the API
     annotate positions with exactly the order `_tick` would pick up in.
     Legacy rows with NULL queued_at fall back to updated_at."""
     entered = _as_utc(story.queued_at or story.updated_at) or story.updated_at
     wait_s = max((now - entered).total_seconds(), 0.0)
+    if story.priority == StoryPriority.URGENT:
+        return (0, 0, 0, -wait_s, story.id)
     starved = 0 if wait_s >= STARVATION_S else 1
     cost = SKILL_COST_RANK.get(story.skill or "medium", 1)
-    return (starved, cost, -wait_s, story.id)
+    return (1, starved, cost, -wait_s, story.id)
 
 
 def deps_met(db: Session, story: Story) -> bool:
@@ -1702,6 +1718,7 @@ def story_payload(story: Story, project_executor: str | None = None) -> dict[str
         "depends_on": json.loads(story.depends_on or "[]"),
         "model": story.model,
         "skill": story.skill,
+        "priority": story.priority or StoryPriority.NORMAL,
         "created_by": story.created_by,
         "execution": effective_execution(story, project_executor),
         "execution_override": story.execution,
@@ -2312,7 +2329,7 @@ def _land_race_detected(
     return behind
 
 
-async def _watch_one_landing(db: Session, story: Story) -> None:
+def _watch_one_landing(db: Session, story: Story) -> None:
     """Advance one story in `landing` from its Gitea PR state.
 
     merged -> done (error cleared, checked FIRST — a merge outranks every
@@ -2725,6 +2742,49 @@ async def _watch_one_landing(db: Session, story: Story) -> None:
                     },
                 )
                 return
+            if (
+                isinstance(e, pr_module.PullRequestUpToDateError)
+                and info.get("mergeable") is not False
+                and head_sha
+            ):
+                # the head is already current and carries the green status:
+                # merge it ourselves, pinned to that sha
+                try:
+                    pr_module.merge_pull(
+                        project.pr_api_base,
+                        project.pr_repo,
+                        token,
+                        int(story.pr_index),
+                        str(head_sha),
+                    )
+                except pr_module.PullRequestError as merge_err:
+                    e = merge_err
+                else:
+                    prev = story.status
+                    story.error = None
+                    story.land_state = None
+                    story.status = StoryStatus.DONE
+                    flags = {
+                        "delivery": "push",
+                        "re_land_green": True,
+                        "up_to_date": True,
+                        "merged": True,
+                        "pr_index": story.pr_index,
+                        "pr_url": story.pr_url,
+                    }
+                    record_event(db, story.id, "note", dict(flags))
+                    _landing_publish(
+                        db,
+                        story,
+                        prev,
+                        {
+                            "from": prev,
+                            "to": StoryStatus.DONE,
+                            "landing": True,
+                            **flags,
+                        },
+                    )
+                    return
             prev = story.status
             story.status = StoryStatus.HUMAN_REVIEW
             story.error = f"land failed: {e}"
@@ -2831,7 +2891,7 @@ async def _watch_one_landing(db: Session, story: Story) -> None:
             db.commit()
 
 
-async def _watch_one_gate_landing(db: Session, story: Story) -> None:
+def _watch_one_gate_landing(db: Session, story: Story) -> None:
     """Close a gate story out when its PR merged anyway (incident 6a438b3d).
 
     A story can sit at human_review with a `land failed:` error while its PR
@@ -3116,6 +3176,13 @@ class StoryRunner:
         # _next_land_poll would let whichever sweep runs first starve the
         # other for the life of the process
         self._next_reconcile_sweep: float = 0.0
+        # dedicated threads for the blocking Gitea/git sweeps: a stuck call
+        # must never starve the default executor that verify and git use
+        self._gitea_pool = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="fubala-gitea"
+        )
+        # sweep name -> (future, monotonic start) of its in-flight run
+        self._sweeps_inflight: dict[str, tuple[asyncio.Future[Any], float]] = {}
         # next monotonic time the orphaned-process-group sweep may run
         # (FUBALA_PROC_SWEEP_INTERVAL, default 600s); `start()` primes it to 0
         # so the first tick after a restart sweeps immediately
@@ -3199,6 +3266,8 @@ class StoryRunner:
             except asyncio.CancelledError:
                 # cancellation is the expected exit path for the runner loop
                 log.debug("runner loop cancelled during shutdown")
+        # a sweep stuck in a Gitea call must not hold shutdown
+        self._gitea_pool.shutdown(wait=False, cancel_futures=True)
         # in-flight pipelines should not outlive the server either
         for task in list(self._tasks.values()):
             task.cancel()
@@ -3346,6 +3415,11 @@ class StoryRunner:
         if self._next_reconcile_sweep and now < self._next_reconcile_sweep:
             return
         self._next_reconcile_sweep = now + LAND_POLL_MIN_INTERVAL
+        await self._sweep_off_loop(
+            "reconcile", self._reconcile_failed_sync, RECONCILE_SWEEP_CAP
+        )
+
+    def _reconcile_failed_sync(self) -> None:
         with session_scope(self.engine) as db:
             failed = db.exec(
                 select(Story).where(Story.status == StoryStatus.FAILED)
@@ -3355,6 +3429,39 @@ class StoryRunner:
                     _reconcile_one_failed(db, story)
                 except Exception:  # noqa: BLE001 - one story never sinks the sweep
                     log.exception("reconcile sweep failed for story %s", story.id)
+
+    async def _sweep_off_loop(
+        self, name: str, fn: Callable[[], None], cap: float
+    ) -> None:
+        """Run a blocking sweep (sync urllib / git) on the dedicated pool under
+        a wall-clock cap, so a hanging Gitea can never block the event loop.
+
+        While the previous run of the same sweep is still alive (a thread
+        stuck in DNS cannot be killed) the new one is skipped. On the cap the
+        caller just returns; the next tick retries."""
+        prev = self._sweeps_inflight.get(name)
+        if prev is not None and not prev[0].done():
+            log.warning(
+                "%s sweep still running since %.0fs ago",
+                name,
+                time.monotonic() - prev[1],
+            )
+            return
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(self._gitea_pool, fn)
+        self._sweeps_inflight[name] = (fut, time.monotonic())
+
+        def _retrieve(f: asyncio.Future[Any]) -> None:
+            # a sweep that outlives its cap must not log "never retrieved"
+            if not f.cancelled():
+                f.exception()
+
+        fut.add_done_callback(_retrieve)
+        try:
+            # shield: the cap abandons the wait, not the tracked future
+            await asyncio.wait_for(asyncio.shield(fut), cap)
+        except TimeoutError:
+            log.warning("%s sweep exceeded %.0fs; retrying on a later tick", name, cap)
 
     async def _proc_sweep(self) -> None:
         """Kill orphaned Fubala subprocess groups (see app.procs).
@@ -3421,6 +3528,9 @@ class StoryRunner:
         if self._next_land_poll and now < self._next_land_poll:
             return
         self._next_land_poll = now + LAND_POLL_MIN_INTERVAL
+        await self._sweep_off_loop("land", self._poll_landing_sync, LAND_SWEEP_CAP)
+
+    def _poll_landing_sync(self) -> None:
         with session_scope(self.engine) as db:
             landing = db.exec(
                 select(Story).where(
@@ -3433,7 +3543,7 @@ class StoryRunner:
             ).all()
             for story in landing:
                 try:
-                    await _watch_one_landing(db, story)
+                    _watch_one_landing(db, story)
                 except Exception:  # noqa: BLE001 - one story never sinks the sweep
                     log.exception("landing poll failed for story %s", story.id)
             gated = db.exec(
@@ -3445,7 +3555,7 @@ class StoryRunner:
             ).all()
             for story in gated:
                 try:
-                    await _watch_one_gate_landing(db, story)
+                    _watch_one_gate_landing(db, story)
                 except Exception:  # noqa: BLE001 - one story never sinks the sweep
                     log.exception("gate land poll failed for story %s", story.id)
 
@@ -3597,8 +3707,11 @@ class StoryRunner:
         try:
             from . import train as train_module
 
-            with session_scope(self.engine) as db:
-                train_module.train_tick(db)
+            def _train_sync() -> None:
+                with session_scope(self.engine) as db:
+                    train_module.train_tick(db)
+
+            await self._sweep_off_loop("train", _train_sync, TRAIN_SWEEP_CAP)
         except Exception:  # noqa: BLE001 - the train must never kill the tick
             log.exception("merge train tick failed")
 
@@ -3997,6 +4110,10 @@ class StoryRunner:
         try:
             await self._generate_spec(story_id)
             await self._run_ai_review(story_id)
+        except _HeadlessRequeued:
+            # a spec session in the worker pod: already requeued (fallback cap
+            # full, pod lost) or failed as infrastructure; nothing further runs
+            return
         except GatewayError as e:
             self._handle_gateway_error(story_id, e)
         except Exception as e:  # noqa: BLE001 - story must land in failed, not vanish
@@ -4644,23 +4761,40 @@ class StoryRunner:
             {"story_id": story_id, "text": "[spec] incomplete spec; nudging once\n"},
         )
         self._record_phase(story_id, "spec_nudge", model, spec_effort)
-        second = await run_agent(
-            self.gateway,
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-                {"role": "assistant", "content": spec_text or "(no output)"},
-                {"role": "user", "content": corrective},
-            ],
-            tools=None,
-            max_output_tokens=_phase_budget(settings, "spec_max_output_tokens"),
-            max_output_tokens_cap=int(
-                settings.get("agent_max_output_tokens_cap", 32768) or 0
+        nudge_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+            {"role": "assistant", "content": spec_text or "(no output)"},
+            {"role": "user", "content": corrective},
+        ]
+        if cli_target is not None and self._spec_pod(story_id, spec_root) is not None:
+            # the main session ran in the worker pod: so does the nudge
+            text, usage = await self._spec_cli_session(
+                story_id, cli_target, nudge_messages, spec_root, settings,
+                cli_tools="", max_turns=None,
+                timeout=float(policy.timeout_seconds or 600),
+                effort=spec_effort, spec_tag=f"{story_id}-spec",
             )
-            or None,
-            effort=spec_effort,
-        )
+            second = AgentResult(
+                text=text,
+                usage=usage,
+                rounds=1,
+                tool_calls=0,
+                complete=(usage.finish_reason or "") != "length",
+            )
+        else:
+            second = await run_agent(
+                self.gateway,
+                model=model,
+                messages=nudge_messages,
+                tools=None,
+                max_output_tokens=_phase_budget(settings, "spec_max_output_tokens"),
+                max_output_tokens_cap=int(
+                    settings.get("agent_max_output_tokens_cap", 32768) or 0
+                )
+                or None,
+                effort=spec_effort,
+            )
         if second.complete and _deliverable_ok(second.text, story_kind):
             self._finish(
                 story_id,
@@ -4761,20 +4895,27 @@ class StoryRunner:
     async def _run_spec_cli(
         self, story_id, target, messages, spec_root, settings, policy, effort=None
     ) -> AgentResult:
-        from .providers.claude_code import READ_ONLY_CLI_TOOLS, run_cli_agent
-
-        resolved, key = target
-        text, usage = await run_cli_agent(
-            resolved,
-            key,
-            messages,
-            cwd=spec_root,
-            cli_tools=READ_ONLY_CLI_TOOLS,
-            max_turns=(policy.max_tool_calls or 40) + 1,
-            max_output_tokens=_phase_budget(settings, "spec_max_output_tokens"),
-            timeout=float(policy.timeout_seconds or 600),
-            effort=effort,
-        )
+        spec_tag = f"{story_id}-spec"
+        if spec_root and str(settings.get("run_executor") or "") == "pod":
+            # the session runs in a worker pod placed like the coder's, built
+            # lazily here so specs that are no CLI session never get a pod
+            if story_id not in self._executors:
+                executor = self._make_executor(story_id, asyncio.get_running_loop())
+                if executor is not None:
+                    self._executors[story_id] = executor
+            if not await self._fallback_gate(story_id):
+                raise _HeadlessRequeued()  # requeued: the dev node is full
+        try:
+            text, usage = await self._spec_cli_session(
+                story_id, target, messages, spec_root, settings,
+                cli_tools=READ_ONLY_CLI_TOOLS,
+                max_turns=(policy.max_tool_calls or 40) + 1,
+                timeout=float(policy.timeout_seconds or 600),
+                effort=effort,
+                spec_tag=spec_tag,
+            )
+        finally:
+            code_graph.cleanup(spec_tag)
         bus.publish("story_log", {"story_id": story_id, "text": text})
         return AgentResult(
             text=text,
@@ -4782,6 +4923,67 @@ class StoryRunner:
             rounds=1,
             tool_calls=0,
             complete=(usage.finish_reason or "") != "length",
+        )
+
+    def _spec_pod(self, story_id: str, spec_root) -> pods.PodExecutor | None:
+        """The run's executor when a spec CLI session may run in its pod."""
+        executor = self._executors.get(story_id)
+        if executor is not None and executor.mode == "pod" and not executor.disabled and spec_root:
+            return executor
+        return None
+
+    async def _spec_cli_session(
+        self, story_id, target, messages, spec_root, settings, *,
+        cli_tools, max_turns, timeout, effort, spec_tag,
+    ) -> tuple[str, Any]:
+        """One spec-phase `claude -p` session: in the run's worker pod when
+        there is one, else (no pod, or PodUnavailable before the exec started)
+        as a local child process. PodRunLost after it started is never rerun
+        locally: the first loss requeues the story, a second fails it."""
+        from .providers import claude_code as cc
+
+        resolved, key = target
+        max_output_tokens = _phase_budget(settings, "spec_max_output_tokens")
+        pod_ex = self._spec_pod(story_id, spec_root)
+        if pod_ex is not None:
+            graph_on = bool(cli_tools) and self._code_graph_project(story_id)[1]
+            argv, env, prompt = cc.build_cli_session(
+                resolved, key, messages, cli_tools=cli_tools, max_turns=max_turns,
+                max_output_tokens=max_output_tokens, effort=effort,
+                # the pod builds its own graph under /tmp
+                mcp_config=code_graph.pod_mcp_config_json(pods.REPO_DIR) if graph_on else None,
+            )
+            # the exec is bounded by timeout + margin, plus the snapshot sync
+            self._set_watchdog_floor(story_id, timeout + pods.EXEC_MARGIN + 300.0)
+            try:
+                rc, out, err = await asyncio.to_thread(
+                    pod_ex.run_cli_session, argv, env, prompt, timeout, Path(spec_root)
+                )
+            except pods.PodUnavailable:
+                pass  # before the exec started: run locally (logged once by the pod)
+            except pods.PodRunLost as e:
+                if self._requeue_pod_lost(story_id, str(e), pod_ex):
+                    raise _HeadlessRequeued() from None
+                if self._still_this_run(story_id, pod_ex):
+                    self._fail_infrastructure(story_id, f"worker pod lost mid-run: {e}")
+                raise _HeadlessAborted() from None
+            else:
+                if rc == 124:
+                    raise GatewayError(
+                        f"[{resolved.provider.id}] claude CLI timed out after {timeout:.0f}s"
+                    )
+                return cc.parse_cli_result(resolved.provider.id, key, rc, out, err)
+            finally:
+                self._clear_watchdog_floor(story_id)
+        mcp_config = (
+            await self._graph_mcp(story_id, spec_root, spec_tag)
+            if spec_root and cli_tools
+            else None
+        )
+        return await cc.run_cli_agent(
+            resolved, key, messages, cwd=spec_root, cli_tools=cli_tools,
+            max_turns=max_turns, max_output_tokens=max_output_tokens,
+            timeout=timeout, effort=effort, mcp_config=mcp_config,
         )
 
     async def _run_spec_agent(
@@ -4827,6 +5029,35 @@ class StoryRunner:
                 return None, [], None
             extras = json.loads(project.extra_paths or "[]")
             return project.root, extras, project.id
+
+    def _code_graph_project(self, story_id: str) -> tuple[str | None, bool]:
+        """(project id, code_graph_enabled) of a story's project; NULL = off."""
+        with Session(self.engine) as db:
+            story = db.get(Story, story_id)
+            project_id = story.project_id if story else None
+            project = db.get(Project, project_id) if project_id else None
+            return project_id, bool(project and project.code_graph_enabled)
+
+    async def _graph_mcp(
+        self, story_id: str, worktree: Path | str, tag: str | None = None
+    ) -> str | None:
+        """Inline --mcp-config JSON for a CLI session in `worktree`, or None
+        (setting off, or the bounded graph build failed: the session runs
+        without MCP)."""
+        project_id, enabled = self._code_graph_project(story_id)
+        if not enabled:
+            return None
+        tree = Path(worktree)
+        out = await asyncio.to_thread(
+            code_graph.build, tree, code_graph.graph_dir(tag or story_id), project_id
+        )
+        if out is None:
+            bus.publish(
+                "story_log",
+                {"story_id": story_id, "text": "[code-graph] build failed; running without MCP\n"},
+            )
+            return None
+        return code_graph.mcp_config_json(tree, out)
 
     def _flash_model_for_provider(self, resolved) -> str | None:
         """The provider's cheapest (low-skill) model id, for the headless
@@ -5368,6 +5599,15 @@ class StoryRunner:
                 and project_root
                 and not await asyncio.to_thread(workspaces.merge_in_progress, workspace_path)
             )
+            graph_on = self._code_graph_project(story_id)[1]
+            if graph_on:
+                # the pod builds its own graph under /tmp; locally the graph
+                # lives in the data dir. Never in the worktree.
+                config.mcp_config = (
+                    code_graph.pod_mcp_config_json(pods.REPO_DIR)
+                    if use_pod
+                    else await self._graph_mcp(story_id, workspace_path)
+                )
             floor = config.timeout_seconds + (pods.EXEC_MARGIN + 300.0 if use_pod else 0.0)
             self._set_watchdog_floor(story_id, floor)
             try:
@@ -5387,6 +5627,10 @@ class StoryRunner:
                         )
                     except pods.PodUnavailable:
                         outcome = None  # before the exec started: run locally
+                        if graph_on:
+                            config.mcp_config = await self._graph_mcp(
+                                story_id, workspace_path
+                            )
                     except pods.PodRunLost as e:
                         # after it started: never rerun the round locally.
                         # The first loss requeues the story, a second fails
@@ -5410,6 +5654,8 @@ class StoryRunner:
                     )
             finally:
                 self._clear_watchdog_floor(story_id)
+                if graph_on:
+                    code_graph.cleanup(story_id)
             with session_scope(self.engine) as db:
                 record_event(
                     db,
@@ -5423,6 +5669,7 @@ class StoryRunner:
                         "num_turns": outcome.num_turns,
                         "outcome": outcome.outcome,
                         "exit_code": outcome.exit_code,
+                        "graph_tool_calls": outcome.graph_tool_calls,
                         "feedback": False,
                     },
                 )
@@ -6021,6 +6268,36 @@ class StoryRunner:
                 )
         return result
 
+    async def _impact_section(
+        self, story_id: str, project_root: str, base: str, project_id: str | None
+    ) -> str:
+        """The `## Impact report` prompt section for a story diff, recorded
+        as a note event. Fails open: the section then says it is unavailable."""
+        worktree = workspaces.worktree_path(project_root, story_id)
+        out_dir = code_graph.graph_dir(story_id)
+        report: str | None = None
+        try:
+            built = await asyncio.to_thread(code_graph.build, worktree, out_dir, project_id)
+            if built is not None:
+                report = await asyncio.to_thread(
+                    code_graph.impact_report, worktree, base, built
+                )
+        finally:
+            code_graph.cleanup(story_id)
+        with session_scope(self.engine) as db:
+            record_event(
+                db,
+                story_id,
+                "note",
+                {
+                    "impact_report": True,
+                    "content": report or code_graph.UNAVAILABLE,
+                    "available": report is not None,
+                    "feedback": False,
+                },
+            )
+        return code_graph.report_section(report)
+
     async def _run_code_review(self, story_id: str) -> None:
         settings = load_settings(self.engine)
         project_root = settings.get("project_root")
@@ -6162,6 +6439,9 @@ class StoryRunner:
             model = story.model
             story_title = story.title
             story_spec = (story.spec or "")[:8000]
+            review_project = db.get(Project, story.project_id) if story.project_id else None
+            graph_project_id = story.project_id
+            graph_on = bool(review_project and review_project.code_graph_enabled)
             # parsed here while the story is bound to the session; consulted
             # after the review stream to keep a red verify from approving
             verify = None
@@ -6180,6 +6460,13 @@ class StoryRunner:
         review_effort = self._cli_effort(model, settings.get("review_effort"))
         self._record_phase(story_id, "code_review", model, review_effort)
 
+        # code graph: the impact report of the story diff, in every prompt path
+        impact_section = ""
+        if graph_on and project_root:
+            impact_section = await self._impact_section(
+                story_id, project_root, base, graph_project_id
+            )
+
         chunks = chunk_diff(diff, max_chars=DIFF_CHUNK_SIZE)
         num_chunks = len(chunks)
 
@@ -6194,6 +6481,7 @@ class StoryRunner:
                     "## Spec",
                     story_spec,
                     verify_section,
+                    *([impact_section] if impact_section else []),
                     *([branch_warning_section] if branch_warning_section else []),
                     *(
                         [_reject_reasons_section(reject_reasons, reason_points)]
@@ -6245,6 +6533,7 @@ class StoryRunner:
                         "## Spec",
                         story_spec,
                         verify_section,
+                        *([impact_section] if impact_section else []),
                         *([branch_warning_section] if branch_warning_section else []),
                         "## Note on Diff Chunking",
                         f"This is Chunk {chunk_label} of the unified diff. "
@@ -6280,6 +6569,7 @@ class StoryRunner:
                         "## Spec",
                         story_spec,
                         verify_section,
+                        *([impact_section] if impact_section else []),
                         *([branch_warning_section] if branch_warning_section else []),
                         "## Previous Chunks Review Summary",
                         prior_summary[:8000],

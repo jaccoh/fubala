@@ -578,6 +578,19 @@ class _PRHandler(BaseHTTPRequestHandler):
         # called with ?style=merge (recorded above in full, matched here
         # without it — the bug the real Gitea client and the fake shared)
         path = self.path.split("?")[0].rstrip("/")
+        if path.endswith("/merge") and "/pulls/" in path:
+            index = int(path.split("/")[-2])
+            if self.server.merge_refusals > 0:
+                self.server.merge_refusals -= 1
+                self._json(
+                    409, {"message": "merge refused: not mergeable"}
+                )
+                return
+            info = self.server.pulls.get(index)
+            if info is not None:
+                info["merged"] = True
+            self._json(200, {"message": "merged"})
+            return
         if path.endswith("/update"):
             index = int(path.split("/")[-2])
             info = self.server.pulls.get(index)
@@ -793,6 +806,7 @@ def _fake_gitea(
     update_up_to_date=0,
     update_server_errors=0,
     update_flip_merged=0,
+    merge_refusals=0,
     pull_files=None,
     runs=None,
     pr_html_url="http://gitea.local/acme/app/pulls/7",
@@ -832,6 +846,7 @@ def _fake_gitea(
       update_refusals = N      # first N POSTs of …/update 409 "cannot
                                # update branch" (a conflict the base
                                # introduced); 0 lets them through
+      merge_refusals = N       # first N POSTs of …/merge answer 409
       update_up_to_date = N    # first N POSTs of …/update answer 500
                                # {"message": "HeadBranch of PR <index> is up
                                # to date"} — Gitea's misused 500 for "the
@@ -868,6 +883,7 @@ def _fake_gitea(
     server.base_refs = dict(base_refs or {})
     server.update_refusals = update_refusals
     server.update_flip_merged = update_flip_merged
+    server.merge_refusals = merge_refusals
     server.update_server_errors = update_server_errors
     server.pull_files = dict(pull_files or {})
     server.update_up_to_date = update_up_to_date
@@ -2502,6 +2518,93 @@ def test_land_green_unmerged_re_lands_after_the_dwell(tmp_path, monkeypatch):
                 "land run green but the PR is not merged (attempt 1/3)"
             )
             assert notes[0]["pr_index"] == 7
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _merge_calls(server):
+    return [
+        r
+        for r in server.requests
+        if r["method"] == "POST" and r["path"].split("?")[0].endswith("/merge")
+    ]
+
+
+def _green_unmerged_case(tmp_path, monkeypatch, name, **fake):
+    from app import pr as pr_module
+
+    _fast_land_polls(monkeypatch)
+    monkeypatch.setattr(pr_module, "PR_BACKOFF_BASE", 0.0)
+    server = _fake_gitea(
+        pulls={7: {"merged": False, "mergeable": True, "state": "open"}},
+        pull_heads={7: "aaa"},
+        pull_files={7: ["backend/app/runner.py"]},
+        **fake,
+    )
+    return server
+
+
+def test_land_green_up_to_date_500_merges_the_pr_itself(tmp_path, monkeypatch):
+    """Gitea's 'HeadBranch of PR 7 is up to date' 500 on update: one update
+    POST, one merge POST pinned to the head, story done."""
+    server = _green_unmerged_case(
+        tmp_path, monkeypatch, "utd.db", update_up_to_date=1
+    )
+    try:
+        with _start_race_story(tmp_path, monkeypatch, server, "utd.db") as (
+            client,
+            sid,
+            approved,
+        ):
+            server.statuses["aaa"] = _green_statuses()
+            done = wait_status(client, sid, ("done",), timeout=30.0)
+            assert done["error"] is None
+            assert len(_update_calls(server)) == 1, server.requests
+            merges = _merge_calls(server)
+            assert len(merges) == 1, server.requests
+            assert merges[0]["body"]["head_commit_id"] == "aaa"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_land_green_other_500_parks_without_merging(tmp_path, monkeypatch):
+    """A 500 that is not the up-to-date answer never triggers a merge."""
+    server = _green_unmerged_case(
+        tmp_path, monkeypatch, "other500.db", update_server_errors=99
+    )
+    try:
+        with _start_race_story(tmp_path, monkeypatch, server, "other500.db") as (
+            client,
+            sid,
+            approved,
+        ):
+            server.statuses["aaa"] = _green_statuses()
+            parked = wait_status(client, sid, ("human_review",), timeout=30.0)
+            assert parked["error"].startswith("land failed:")
+            assert "500" in parked["error"]
+            assert _merge_calls(server) == []
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_land_green_up_to_date_refused_merge_parks(tmp_path, monkeypatch):
+    server = _green_unmerged_case(
+        tmp_path, monkeypatch, "refused.db", update_up_to_date=1, merge_refusals=1
+    )
+    try:
+        with _start_race_story(tmp_path, monkeypatch, server, "refused.db") as (
+            client,
+            sid,
+            approved,
+        ):
+            server.statuses["aaa"] = _green_statuses()
+            parked = wait_status(client, sid, ("human_review",), timeout=30.0)
+            assert parked["error"].startswith("land failed:")
+            assert "merge refused" in parked["error"]
+            assert len(_merge_calls(server)) == 1
     finally:
         server.shutdown()
         server.server_close()

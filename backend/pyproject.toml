@@ -37,6 +37,12 @@ dev = [
     "pytest-timeout>=2.3",
 ]
 
+# Not a dependency (see app/code_graph.py: it needs mcp<2, the backend runs mcp 2):
+# the one pin for the isolated `uv tool install` in Dockerfile and
+# docker/worker.Dockerfile. tests/test_worker_image_parity.py keeps them equal.
+[tool.fubala]
+code-review-graph = "2.3.9"
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
