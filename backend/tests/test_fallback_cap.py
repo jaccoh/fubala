@@ -132,3 +132,75 @@ def test_no_node_name_keeps_old_behaviour(tmp_path, monkeypatch):
     r = _setup(tmp_path, monkeypatch, FakeKube(), mode="in_process")
     pods._FALLBACK_HELD.update({"s1", "s2"})
     assert _gate(r) is True
+
+
+def _cap0(r, mode="pod"):
+    settings_store.save_settings(r.engine, {"run_executor": mode, "worker_fallback_parallel": 0})
+
+
+def _no_local(monkeypatch):
+    from app.providers import claude_code as cc
+    from app import procs
+
+    def boom(*a, **k):
+        raise AssertionError("ran locally with fallback cap 0")
+
+    monkeypatch.setattr(procs, "LocalExecutor", boom)
+    monkeypatch.setattr(cc, "run_cli_agent", boom)
+
+
+def test_defaults_and_helpers(monkeypatch):
+    assert settings_store.DEFAULTS["worker_fallback_parallel"] == 2
+    assert pods.fallback_cap({}) == 2
+    assert pods.fallback_cap({"worker_fallback_parallel": None}) == 2
+    assert pods.fallback_cap({"worker_fallback_parallel": 0}) == 0
+    assert pods.local_fallback_disabled({"worker_fallback_parallel": 0}) is True
+    assert pods.local_fallback_disabled({"worker_fallback_parallel": 1}) is False
+    monkeypatch.delenv("NODE_NAME")
+    assert pods.local_fallback_disabled({"worker_fallback_parallel": 0}) is False
+
+
+def test_cap0_pending_dev_node_requeues_without_local_run(tmp_path, monkeypatch):
+    _no_local(monkeypatch)
+    monkeypatch.setattr(pods, "PENDING_LIMIT", 0)
+    r = _setup(tmp_path, monkeypatch, FakeKube(phases=("Pending",)), mode="pod")
+    _cap0(r)
+    assert _gate(r) is False
+    status, notes, _ = _state(r)
+    assert status == StoryStatus.QUEUED
+    assert "fallback cap 0" in notes[0]
+
+
+def test_cap0_pod_on_backend_node_is_requeued_and_deleted(tmp_path, monkeypatch):
+    kube = FakeKube(node="stor01")
+    r = _setup(tmp_path, monkeypatch, kube, mode="pod")
+    _cap0(r)
+    assert not pods._FALLBACK_HELD
+    assert _gate(r) is False
+    assert _state(r)[0] == StoryStatus.QUEUED
+    assert len(kube.deleted) == 1
+
+
+def test_cap0_without_node_name_changes_nothing(tmp_path, monkeypatch):
+    monkeypatch.delenv("NODE_NAME")
+    r = _setup(tmp_path, monkeypatch, FakeKube(), mode="in_process")
+    settings_store.save_settings(r.engine, {"worker_fallback_parallel": 0})
+    assert _gate(r, with_executor=False) is True
+
+
+def test_cap0_verify_command_never_runs_locally(tmp_path, monkeypatch):
+    from app import runner as runner_mod
+
+    _no_local(monkeypatch)
+    monkeypatch.setattr(pods, "PENDING_LIMIT", 0)
+    r = _setup(tmp_path, monkeypatch, FakeKube(phases=("Pending",)), mode="pod")
+    _cap0(r)
+
+    async def scenario():
+        ex = r._make_executor("s3", asyncio.get_running_loop())
+        with pytest.raises(pods.FallbackCapFull):
+            await asyncio.to_thread(
+                runner_mod._run_verify_command, tmp_path, "true", 5, None, "s3", ex
+            )
+
+    asyncio.run(scenario())

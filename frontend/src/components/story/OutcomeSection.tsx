@@ -7,6 +7,7 @@ import type {
   StoryStatus,
   VerifyLaneCounts,
 } from "@/types";
+import { verdictBadge } from "@/components/boardColumns";
 import { BADGE, badgeTone, PANEL } from "@/components/ui";
 
 /** Statuses where the story is finished enough to lead with the outcome. */
@@ -60,7 +61,7 @@ export function OutcomeSection({
   verify: EvidenceVerify | null;
 }) {
   const summary = detail?.evidence?.summary?.trim() || reviewTeaser(live.ai_review);
-  const verdict = live.ai_verdict;
+  const verdictTag = verdictBadge(live.ai_verdict);
   // info/prep stories carry {"applicable": false} — no verify stage ever ran,
   // so there is no `passed` to read. Checked BEFORE any !passed logic.
   const notApplicable = verify?.applicable === false;
@@ -72,10 +73,8 @@ export function OutcomeSection({
         <h3 className="text-[11px] font-semibold tracking-wide text-zinc-200 uppercase">
           Outcome
         </h3>
-        {verdict && (
-          <span className={`${BADGE} ${badgeTone(verdict === "approved")}`}>
-            {verdict === "approved" ? "✓ approved" : "✗ rejected"}
-          </span>
+        {verdictTag && (
+          <span className={`${BADGE} ${verdictTag.tone}`}>{verdictTag.label}</span>
         )}
         {verify && (notApplicable ? (
           <span className={`${BADGE} border-zinc-700/70 bg-zinc-800/40 text-zinc-400`}>

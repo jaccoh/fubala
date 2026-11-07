@@ -596,7 +596,7 @@ def test_a_verify_that_raises_or_is_cancelled_frees_the_only_test_slot(
 # ---- coder rounds: pump and headless ---------------------------------------
 
 
-def test_pump_coder_rounds_share_the_model_slots(tmp_path):
+def test_pump_coder_rounds_share_the_model_slots(tmp_path, legacy_review):
     gw = SlotGateway(block=(CODE,))
     runner = make_runner(tmp_path, gw, **coder_settings(tmp_path))
     ids = [
@@ -687,6 +687,111 @@ def test_headless_runs_hold_a_model_slot_for_the_whole_cli_run(tmp_path, monkeyp
 
     asyncio.run(scenario())
     assert gw.peak == 1  # the code reviews take the slot one at a time too
+
+
+def test_headless_suite_runs_outside_the_model_slot_and_resumes_the_session(
+    tmp_path, monkeypatch
+):
+    from test_headless import install_fake_claude, on_path
+
+    capture = tmp_path / "capture.txt"
+    bindir = install_fake_claude(
+        tmp_path, "runtests", env={"FAKE_CLAUDE_CAPTURE": str(capture)}
+    )
+    gw = SlotGateway()
+    runner = make_runner(
+        tmp_path, gw, **coder_settings(tmp_path, verify_command="true")
+    )
+    a = add_story(
+        runner, "headless", StoryStatus.EXECUTING, spec=MINIMAL_SPEC, execution="headless"
+    )
+    b = add_story(runner, "generating", StoryStatus.IN_PROGRESS)
+
+    async def scenario() -> None:
+        sig = Signal(asyncio.get_running_loop())
+        gw.sig = sig
+        watch(runner, sig)
+        verify = FakeVerify(sig)
+        verify.runner = runner
+        monkeypatch.setattr(runner_mod, "_run_verify_command", verify)
+        runner._model_pool.resize(1)
+        runner._test_pool.resize(1)
+        with on_path(bindir):
+            launch_coders(runner, [a])
+            await sig.until(lambda: verify.started == [a])
+            # the suite runs outside the session: no model slot, one test slot
+            assert runner._model_pool.holders() == []
+            assert runner._test_pool.holders() == [a]
+            # the single model slot is free: another story's spec call runs
+            tb = asyncio.create_task(runner._generate_spec(b))
+            await sig.until(lambda: gw.calls(SPEC) == 1, timeout=10)
+            assert verify.running == 1
+            await asyncio.wait_for(tb, WAIT)
+            verify.gate.set()
+            await drain(runner)
+
+    asyncio.run(scenario())
+    calls = capture.read_text().split("--- end call ---")
+    assert len([c for c in calls if c.strip()]) == 1
+    resumed = calls[0].splitlines()
+    assert resumed[resumed.index("--resume") + 1] == "sess-fake-1"
+    assert "=== TEST RESULT ===" in calls[0]
+    assert "Exit code: 0" in calls[0]
+    assert "1 passed" in calls[0]
+    assert status_of(runner, a) != StoryStatus.EXECUTING
+
+
+def test_a_fourth_suite_request_ends_the_round_as_ok_and_cuts_are_logged(
+    tmp_path, monkeypatch
+):
+    gw = SlotGateway()
+    runner = make_runner(
+        tmp_path, gw, **coder_settings(tmp_path, verify_command="true")
+    )
+    a = add_story(
+        runner, "headless", StoryStatus.EXECUTING, spec=MINIMAL_SPEC, execution="headless"
+    )
+    logs: list[str] = []
+    real_publish = bus.publish
+
+    def record(kind, payload, *a, **kw):
+        if kind == "story_log":
+            logs.append(payload["text"])
+        return real_publish(kind, payload, *a, **kw)
+
+    monkeypatch.setattr(bus, "publish", record)
+    segments: list[dict] = []
+
+    def fake_code_stage(*, story_id, worktree, prompt, config, on_event, **resume):
+        segments.append(resume)
+        (Path(worktree) / "feature.py").write_text("x = 1\n")
+        return headless_exec.HeadlessOutcome(
+            outcome="run_tests", num_turns=1, duration_ms=1, session_id="sid",
+            config_dir=str(tmp_path / "kept"), targeted_cuts=1,
+        )
+
+    suites: list[str] = []
+
+    def verify(ws, command, timeout, project_root=None, story_id=None, executor=None):
+        suites.append(story_id)
+        return 0, "1 passed in 0.01s\n"
+
+    monkeypatch.setattr(headless_exec, "run_code_stage", fake_code_stage)
+    monkeypatch.setattr(runner_mod, "_run_verify_command", verify)
+    (tmp_path / "kept").mkdir()
+
+    async def scenario() -> None:
+        launch_coders(runner, [a])
+        await drain(runner)
+
+    asyncio.run(scenario())
+    # 1 first segment + 3 resumed ones; the 4th request is a finish
+    assert len(segments) == 4 and segments[0] == {}
+    assert all(seg["resume_session_id"] == "sid" for seg in segments[1:])
+    assert any("test request cap (3) reached" in t for t in logs)
+    assert sum("targeted test run cut at" in t for t in logs) == 4
+    assert not (tmp_path / "kept").exists()
+    assert status_of(runner, a) != StoryStatus.EXECUTING
 
 
 # ---- worker pods only inside a slot ----------------------------------------

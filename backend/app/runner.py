@@ -16,7 +16,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from collections import deque
@@ -32,7 +34,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, or_, select
 
-from . import code_graph, pods, procs, workspaces
+from . import code_graph, pods, procs, review_evidence, workspaces
 from . import headless as headless_exec
 from .agent import AgentResult, run_agent, strip_placeholders, tool_log_line
 from .agent_tools import ToolBox
@@ -73,6 +75,13 @@ class RejectFeedback:
     source: str  # "operator" | "ai"
 
 
+# most full-suite requests (FUBALA_RUN_TESTS) one headless round may make; a
+# further one is treated as a finish (the pipeline's own verify follows)
+HEADLESS_MAX_TEST_REQUESTS = 3
+# the verify output tail handed back to the resumed session
+HEADLESS_TEST_RESULT_CAP = 8 * 1024
+
+
 class _HeadlessRequeued(Exception):
     """Internal control flow: the headless child hit a rate limit and the
     story was already requeued with backoff. The CODE stage must stop here
@@ -87,6 +96,20 @@ class _HeadlessAborted(_HeadlessRequeued):
     without taking any further path."""
 
 
+class _ReviewPodGone(Exception):
+    """Internal control flow: the code review's worker pod was unavailable a
+    second time. The review ends `incomplete`; nothing runs locally."""
+
+
+@dataclass
+class _ReviewTurn:
+    """One code-review model session: its text and how it ended."""
+
+    text: str = ""
+    timed_out: bool = False
+    turn_cap: bool = False
+
+
 class _FixRoundParked(Exception):
     """Internal control flow: a headless verify fix round crashed and the
     story was already parked in human_review. The caller must not finish it."""
@@ -97,6 +120,8 @@ log = logging.getLogger(__name__)
 # A worker pod lost mid-run requeues its story this many times (per story,
 # for its whole life) before the loss fails it as infrastructure.
 POD_LOST_REQUEUE_CAP = 1
+# the code review's worker pod unavailable: requeue once, then `incomplete`
+REVIEW_POD_REQUEUE_CAP = 1
 # short fixed wait of a run bounced by the backend-node fallback cap (a
 # capacity wait, not a provider error)
 FALLBACK_WAIT_SECONDS = 60
@@ -1462,8 +1487,10 @@ def _run_verify_command(
                 None,
                 timeout,
             )
-        except pods.PodUnavailable:
-            pass  # fall through to the in-process path below
+        except pods.PodUnavailable as e:
+            if pods.local_fallback_disabled(executor.settings):
+                raise pods.FallbackCapFull("fallback cap 0: no local verify") from e
+            # fall through to the in-process path below
         except (OSError, subprocess.SubprocessError) as e:
             executor.close()
             log.warning("worker pod verify failed (%s); running in-process", e)
@@ -4316,7 +4343,7 @@ class StoryRunner:
         applies in-cluster (NODE_NAME set)."""
         if not pods.backend_node():
             return True
-        cap = int(load_settings(self.engine).get("worker_fallback_parallel") or 2)
+        cap = pods.fallback_cap(load_settings(self.engine))
         executor = self._executors.get(story_id)
         kube = None
         if executor is not None:
@@ -4535,6 +4562,9 @@ class StoryRunner:
     def _pod_lost_requeues(self, story_id: str) -> int:
         """Pod-loss requeues so far, counted from the status events so the
         count survives a restart."""
+        return self._status_flag_count(story_id, "pod_lost_requeue")
+
+    def _status_flag_count(self, story_id: str, flag: str) -> int:
         with session_scope(self.engine) as db:
             rows = db.exec(
                 select(StoryEvent.data).where(
@@ -4547,7 +4577,7 @@ class StoryRunner:
                 data = json.loads(raw or "{}")
             except ValueError:
                 continue
-            if isinstance(data, dict) and data.get("pod_lost_requeue") is True:
+            if isinstance(data, dict) and data.get(flag) is True:
                 count += 1
         return count
 
@@ -5152,7 +5182,11 @@ class StoryRunner:
                     pod_ex.run_cli_session, argv, env, prompt, timeout, Path(spec_root)
                 )
             except pods.PodUnavailable:
-                pass  # before the exec started: run locally (logged once by the pod)
+                # before the exec started: run locally (logged once by the pod),
+                # unless the fallback cap is 0
+                if pods.local_fallback_disabled(settings):
+                    self._requeue_fallback_wait(story_id, 0)
+                    raise _HeadlessRequeued() from None
             except pods.PodRunLost as e:
                 if self._requeue_pod_lost(story_id, str(e), pod_ex):
                     raise _HeadlessRequeued() from None
@@ -5236,13 +5270,11 @@ class StoryRunner:
         """Inline --mcp-config JSON for a CLI session in `worktree`, or None
         (setting off, or the bounded graph build failed: the session runs
         without MCP)."""
-        project_id, enabled = self._code_graph_project(story_id)
+        _, enabled = self._code_graph_project(story_id)
         if not enabled:
             return None
         tree = Path(worktree)
-        out = await asyncio.to_thread(
-            code_graph.build, tree, code_graph.graph_dir(tag or story_id), project_id
-        )
+        out = await asyncio.to_thread(code_graph.build, tree, code_graph.graph_dir(tag or story_id))
         if out is None:
             bus.publish(
                 "story_log",
@@ -5724,12 +5756,17 @@ class StoryRunner:
             """One headless CODE round: attach the tool-neutral rules to the
             runner-built CODE REQUEST, run the child, map the outcome onto
             the runner's existing finish paths."""
+            settings_now = load_settings(self.engine)
+            test_timeout = float(
+                settings_now.get("headless_test_timeout_seconds")
+                or headless_exec.HEADLESS_TEST_TIMEOUT_DEFAULT
+            )
             prompt = headless_exec.with_rules(
                 prompt,
                 test_command=test_command or None,
                 verify_command=verify_command or None,
+                test_timeout_seconds=test_timeout,
             )
-            settings_now = load_settings(self.engine)
             base_url: str | None = None
             api_key: str | None = None
             small_fast: str | None = None
@@ -5762,6 +5799,7 @@ class StoryRunner:
                     )
                     or headless_exec.HEADLESS_TIMEOUT_DEFAULT
                 ),
+                test_timeout_seconds=test_timeout,
                 # per-story artifact dir (kept transcripts land under
                 # <data>/headless/<story>/<stamp>.jsonl)
                 artifacts_dir=str(data_dir_for_artifacts()),
@@ -5781,77 +5819,231 @@ class StoryRunner:
                     {**payload, "phase": "coder", "executor": StoryExecution.HEADLESS},
                 )
 
-            # one model slot for the whole CLI run (tests it runs inside the
-            # run included); the pod is set up inside it (_coder_slot)
-            async with self._coder_slot(story_id):
-                # run_executor=pod: the CLI runs in the run's worker pod. A merge
-                # in progress (conflict resolution round) stays local: MERGE_HEAD
-                # does not travel in the snapshot bundle.
-                pod_ex = self._executors.get(story_id)
-                use_pod = bool(
-                    pod_ex is not None
-                    and pod_ex.mode == "pod"
-                    and not pod_ex.disabled
-                    and project_root
-                    and not await asyncio.to_thread(workspaces.merge_in_progress, workspace_path)
-                )
-                graph_on = self._code_graph_project(story_id)[1]
-                if graph_on:
-                    # the pod builds its own graph under /tmp; locally the graph
-                    # lives in the data dir. Never in the worktree.
-                    config.mcp_config = (
-                        code_graph.pod_mcp_config_json(pods.REPO_DIR)
-                        if use_pod
-                        else await self._graph_mcp(story_id, workspace_path)
-                    )
-                floor = config.timeout_seconds + (pods.EXEC_MARGIN + 300.0 if use_pod else 0.0)
-                self._set_watchdog_floor(story_id, floor)
-                try:
-                    outcome: headless_exec.HeadlessOutcome | None = None
-                    if use_pod:
-                        assert pod_ex is not None
-                        try:
-                            outcome = await asyncio.to_thread(
-                                pod_ex.run_headless,
-                                prompt,
-                                config,
-                                on_stream,
-                                workspace=workspace_path,
-                                project_root=project_root,
-                                commit_message=f"story {story_id}: coder output",
-                                on_artefacts=_artefact_note_writer(self, story_id),
-                            )
-                        except pods.PodUnavailable:
-                            outcome = None  # before the exec started: run locally
-                            if graph_on:
-                                config.mcp_config = await self._graph_mcp(
-                                    story_id, workspace_path
-                                )
-                        except pods.PodRunLost as e:
-                            # after it started: never rerun the round locally.
-                            # The first loss requeues the story, a second fails
-                            # it. After a cancel the endpoint marks the story
-                            # failed itself, so only abort.
-                            if self._requeue_pod_lost(story_id, str(e), pod_ex):
-                                raise _HeadlessRequeued() from None
-                            if self._still_this_run(story_id, pod_ex):
-                                self._fail_infrastructure(
-                                    story_id, f"worker pod lost mid-run: {e}"
-                                )
-                            raise _HeadlessAborted() from None
-                    if outcome is None:
-                        outcome = await asyncio.to_thread(
-                            headless_exec.run_code_stage,
-                            story_id=story_id,
-                            worktree=workspace_path,
-                            prompt=prompt,
-                            config=config,
-                            on_event=on_stream,
+            async def run_segment(
+                seg_prompt: str, resume: tuple[str, str, bool] | None
+            ) -> tuple[headless_exec.HeadlessOutcome, bool]:
+                """One CLI run (a segment of the round) inside ONE model
+                slot, tests it runs itself (targeted, cut at the short
+                timeout) included. The pod is set up inside it
+                (_coder_slot). `resume` = (session id, config dir, ran in
+                the pod): the CLI session is resumed with `--resume`.
+                Returns the outcome and whether it ran in the pod."""
+                async with self._coder_slot(story_id):
+                    # run_executor=pod: the CLI runs in the run's worker pod. A
+                    # merge in progress (conflict resolution round) stays local:
+                    # MERGE_HEAD does not travel in the snapshot bundle.
+                    pod_ex = self._executors.get(story_id)
+                    use_pod = bool(
+                        pod_ex is not None
+                        and pod_ex.mode == "pod"
+                        and not pod_ex.disabled
+                        and project_root
+                        and not await asyncio.to_thread(
+                            workspaces.merge_in_progress, workspace_path
                         )
-                finally:
-                    self._clear_watchdog_floor(story_id)
+                    )
+                    if resume is not None:
+                        # the session lives where the first segment ran
+                        if resume[2] and not use_pod:
+                            return (
+                                headless_exec.HeadlessOutcome(
+                                    outcome="fix",
+                                    reason="worker pod unavailable for the session resume",
+                                ),
+                                False,
+                            )
+                        use_pod = resume[2]
+                    graph_on = self._code_graph_project(story_id)[1]
                     if graph_on:
-                        code_graph.cleanup(story_id)
+                        # the pod builds its own graph under /tmp; locally the
+                        # graph lives in the data dir. Never in the worktree.
+                        config.mcp_config = (
+                            code_graph.pod_mcp_config_json(pods.REPO_DIR)
+                            if use_pod
+                            else await self._graph_mcp(story_id, workspace_path)
+                        )
+                    floor = config.timeout_seconds + (
+                        pods.EXEC_MARGIN + 300.0 if use_pod else 0.0
+                    )
+                    self._set_watchdog_floor(story_id, floor)
+                    try:
+                        outcome: headless_exec.HeadlessOutcome | None = None
+                        if use_pod:
+                            assert pod_ex is not None
+                            try:
+                                outcome = await asyncio.to_thread(
+                                    pod_ex.run_headless,
+                                    seg_prompt,
+                                    config,
+                                    on_stream,
+                                    workspace=workspace_path,
+                                    project_root=project_root,
+                                    commit_message=f"story {story_id}: coder output",
+                                    on_artefacts=_artefact_note_writer(self, story_id),
+                                    **(
+                                        {"resume": (resume[0], resume[1])}
+                                        if resume is not None
+                                        else {}
+                                    ),
+                                )
+                            except pods.PodUnavailable:
+                                if resume is not None:
+                                    return (
+                                        headless_exec.HeadlessOutcome(
+                                            outcome="fix",
+                                            reason="worker pod unavailable for the session resume",
+                                        ),
+                                        True,
+                                    )
+                                if pods.local_fallback_disabled(pod_ex.settings):
+                                    self._requeue_fallback_wait(story_id, 0)
+                                    raise _HeadlessRequeued() from None
+                                outcome = None  # before the exec started: run locally
+                                if graph_on:
+                                    config.mcp_config = await self._graph_mcp(
+                                        story_id, workspace_path
+                                    )
+                            except pods.PodRunLost as e:
+                                # after it started: never rerun the round locally.
+                                # The first loss requeues the story, a second
+                                # fails it. After a cancel the endpoint marks the
+                                # story failed itself, so only abort.
+                                if self._requeue_pod_lost(story_id, str(e), pod_ex):
+                                    raise _HeadlessRequeued() from None
+                                if self._still_this_run(story_id, pod_ex):
+                                    self._fail_infrastructure(
+                                        story_id, f"worker pod lost mid-run: {e}"
+                                    )
+                                raise _HeadlessAborted() from None
+                        if outcome is None:
+                            resume_kwargs: dict[str, Any] = (
+                                {
+                                    "resume_session_id": resume[0],
+                                    "config_dir": resume[1],
+                                }
+                                if resume is not None
+                                else {}
+                            )
+                            use_pod = False
+                            outcome = await asyncio.to_thread(
+                                headless_exec.run_code_stage,
+                                story_id=story_id,
+                                worktree=workspace_path,
+                                prompt=seg_prompt,
+                                config=config,
+                                on_event=on_stream,
+                                **resume_kwargs,
+                            )
+                        return outcome, use_pod
+                    finally:
+                        self._clear_watchdog_floor(story_id)
+                        if graph_on:
+                            code_graph.cleanup(story_id)
+
+            async def run_suite(pod_mode: bool) -> tuple[int, str]:
+                """The full verify command outside the session: the model
+                slot is already released, a test slot is held instead."""
+                pod_ex = self._executors.get(story_id)
+                if story_id not in self._running or (
+                    pod_ex is not None
+                    and pod_mode
+                    and not self._still_this_run(story_id, pod_ex)
+                ):
+                    raise _HeadlessAborted()
+                async with self._test_slot(story_id):
+                    self._set_watchdog_floor(story_id, verify_timeout)
+                    try:
+                        return await asyncio.to_thread(
+                            _run_verify_command,
+                            workspace_path,
+                            verify_command,
+                            verify_timeout,
+                            project_root,
+                            story_id,
+                            pod_ex if pod_mode else None,
+                        )
+                    except pods.FallbackCapFull:
+                        self._requeue_fallback_wait(story_id, 0)
+                        raise _HeadlessRequeued() from None
+                    finally:
+                        self._clear_watchdog_floor(story_id)
+
+            secrets = headless_exec.run_secrets(config)
+            requests = 0
+            cuts = 0
+            total_ms = 0
+            total_turns: int | None = None
+            total_usage: dict[str, Any] = {}
+            resume: tuple[str, str, bool] | None = None
+            resume_prompt = ""
+            kept_local_dir: str | None = None
+            try:
+                while True:
+                    outcome, in_pod = await run_segment(
+                        prompt if resume is None else resume_prompt, resume
+                    )
+                    kept_local_dir = None
+                    total_ms += outcome.duration_ms or 0
+                    if outcome.num_turns is not None:
+                        total_turns = (total_turns or 0) + outcome.num_turns
+                    for key, value in outcome.usage.items():
+                        total_usage[key] = total_usage.get(key, 0) + value
+                    cuts += outcome.targeted_cuts
+                    for _ in range(outcome.targeted_cuts):
+                        bus.publish(
+                            "story_log",
+                            {
+                                "story_id": story_id,
+                                "text": (
+                                    "[coder:headless] targeted test run cut at "
+                                    f"{config.test_timeout_seconds:.0f} s\n"
+                                ),
+                            },
+                        )
+                    if outcome.outcome != "run_tests":
+                        break
+                    if not in_pod:
+                        kept_local_dir = outcome.config_dir
+                    if not verify_command:
+                        # no rule was sent: a stray marker is a plain finish
+                        outcome.outcome = "ok"
+                        break
+                    if requests >= HEADLESS_MAX_TEST_REQUESTS:
+                        bus.publish(
+                            "story_log",
+                            {
+                                "story_id": story_id,
+                                "text": (
+                                    "[coder:headless] test request cap "
+                                    f"({HEADLESS_MAX_TEST_REQUESTS}) reached; "
+                                    "treating the round as finished\n"
+                                ),
+                            },
+                        )
+                        outcome.outcome = "ok"
+                        break
+                    requests += 1
+                    assert outcome.session_id and outcome.config_dir
+                    rc, suite_output = await run_suite(in_pod)
+                    suite_output = headless_exec._redact(suite_output, secrets)
+                    resume_prompt = (
+                        "=== TEST RESULT ===\n"
+                        f"Command: {verify_command}\n"
+                        f"Exit code: {rc}\n"
+                        "Output (tail):\n"
+                        + suite_output[-HEADLESS_TEST_RESULT_CAP:]
+                        + "\n\nContinue the story. End your turn with "
+                        f"{headless_exec.RUN_TESTS_MARKER} as the last line "
+                        "to run the suite again."
+                    )
+                    resume = (outcome.session_id, outcome.config_dir, in_pod)
+            finally:
+                if kept_local_dir:
+                    shutil.rmtree(kept_local_dir, ignore_errors=True)
+            outcome.duration_ms = total_ms
+            outcome.num_turns = total_turns
+            outcome.usage = total_usage
+            outcome.targeted_cuts = cuts
             with session_scope(self.engine) as db:
                 record_event(
                     db,
@@ -5866,6 +6058,8 @@ class StoryRunner:
                         "outcome": outcome.outcome,
                         "exit_code": outcome.exit_code,
                         "graph_tool_calls": outcome.graph_tool_calls,
+                        "test_requests": requests,
+                        "targeted_cuts": cuts,
                         "feedback": False,
                     },
                 )
@@ -6337,6 +6531,9 @@ class StoryRunner:
                         story_id,
                         self._executors.get(story_id),
                     )
+                except pods.FallbackCapFull:
+                    self._requeue_fallback_wait(story_id, 0)
+                    raise _HeadlessRequeued() from None
                 finally:
                     self._clear_watchdog_floor(story_id)
             counts = parse_summaries(output)
@@ -6469,7 +6666,7 @@ class StoryRunner:
         return result
 
     async def _impact_section(
-        self, story_id: str, project_root: str, base: str, project_id: str | None
+        self, story_id: str, project_root: str, base: str
     ) -> str:
         """The `## Impact report` prompt section for a story diff, recorded
         as a note event. Fails open: the section then says it is unavailable."""
@@ -6477,7 +6674,7 @@ class StoryRunner:
         out_dir = code_graph.graph_dir(story_id)
         report: str | None = None
         try:
-            built = await asyncio.to_thread(code_graph.build, worktree, out_dir, project_id)
+            built = await asyncio.to_thread(code_graph.build, worktree, out_dir)
             if built is not None:
                 report = await asyncio.to_thread(
                     code_graph.impact_report, worktree, base, built
@@ -6640,8 +6837,8 @@ class StoryRunner:
             story_title = story.title
             story_spec = (story.spec or "")[:8000]
             review_project = db.get(Project, story.project_id) if story.project_id else None
-            graph_project_id = story.project_id
             graph_on = bool(review_project and review_project.code_graph_enabled)
+            test_command = resolve_test_command(db, story.project_id)
             # parsed here while the story is bound to the session; consulted
             # after the review stream to keep a red verify from approving
             verify = None
@@ -6663,268 +6860,177 @@ class StoryRunner:
         # code graph: the impact report of the story diff, in every prompt path
         impact_section = ""
         if graph_on and project_root:
-            impact_section = await self._impact_section(
-                story_id, project_root, base, graph_project_id
-            )
+            impact_section = await self._impact_section(story_id, project_root, base)
 
-        chunks = chunk_diff(diff, max_chars=DIFF_CHUNK_SIZE)
-        num_chunks = len(chunks)
-
-        if num_chunks <= 1:
-            bus.publish(
-                "story_log", {"story_id": story_id, "text": "[code-review] reviewing diff\n"}
-            )
-            user_prompt = "\n".join(
-                [
-                    "=== CODE REVIEW REQUEST ===",
-                    f"# Story: {story_title}",
-                    "## Spec",
-                    story_spec,
-                    verify_section,
-                    *([impact_section] if impact_section else []),
-                    *([branch_warning_section] if branch_warning_section else []),
-                    *(
-                        [_reject_reasons_section(reject_reasons, reason_points)]
-                        if reject_reasons
-                        else []
-                    ),
-                    *([binding_section] if binding_section else []),
-                    *([_operator_notes_section(operator_notes)] if operator_notes else []),
-                    "## Diff (unified, vs base)",
-                    chunks[0] if chunks else diff,
-                ]
-            )
-            parts: list[str] = []
-            async for event in self._stream(
-                model,
-                [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                story_id,
-                review_effort,
-            ):
-                if isinstance(event, Delta):
-                    parts.append(event.text)
-            review = "".join(parts)
-            # the verdict is parsed from the review text the reviewer was
-            # actually asked for a verdict in: the single-chunk prompt
-            # (which also carries the reasons section, whole diff present)
-            verdict_review = review
-        else:
-            all_chunk_reviews: list[tuple[int, str]] = []
-            for i, chunk in enumerate(chunks, 1):
-                is_final = i == num_chunks
-                chunk_label = f"{i}/{num_chunks}"
-                bus.publish(
-                    "story_log",
-                    {
-                        "story_id": story_id,
-                        "text": (
-                            f"[code-review] reviewing diff chunk {chunk_label}"
-                            f"{' (final)' if is_final else ''}\n"
-                        ),
-                    },
-                )
-                if not is_final:
-                    prompt_lines = [
-                        f"=== CODE REVIEW REQUEST (Chunk {chunk_label}) ===",
-                        f"# Story: {story_title}",
-                        "## Spec",
-                        story_spec,
-                        verify_section,
-                        *([impact_section] if impact_section else []),
-                        *([branch_warning_section] if branch_warning_section else []),
-                        "## Note on Diff Chunking",
-                        f"This is Chunk {chunk_label} of the unified diff. "
-                        f"Other files/changes are in subsequent chunks "
-                        f"(total {num_chunks} chunks). "
-                        "Do NOT reject for missing items that may be implemented in other chunks. "
-                        "Review this chunk for correctness, security, bugs, and conventions.",
-                        f"## Diff (unified, vs base — Chunk {chunk_label})",
-                        chunk,
-                    ]
-                else:
-                    prior_summary = "\n\n".join(
-                        f"### Review of Chunk {idx}/{num_chunks}\n{rev.strip()}"
-                        for idx, rev in all_chunk_reviews
-                    )
-                    # the reasons NEVER ride in a chunk prompt: a chunk is
-                    # one slice of the diff, and a slice-bound reviewer
-                    # marks whole-diff fixes NOT ADDRESSED ("not in this
-                    # chunk" — incident 50a9f97c). They get their own
-                    # whole-diff call after the loop instead; operator
-                    # notes stay here for now (follow-up story).
-                    reason_lines = [
-                        *([binding_section] if binding_section else []),
-                        *(
-                            [_operator_notes_section(operator_notes)]
-                            if operator_notes
-                            else []
-                        ),
-                    ]
-                    prompt_lines = [
-                        f"=== CODE REVIEW REQUEST (Chunk {chunk_label} — FINAL CHUNK) ===",
-                        f"# Story: {story_title}",
-                        "## Spec",
-                        story_spec,
-                        verify_section,
-                        *([impact_section] if impact_section else []),
-                        *([branch_warning_section] if branch_warning_section else []),
-                        "## Previous Chunks Review Summary",
-                        prior_summary[:8000],
-                        f"## Diff (unified, vs base — Chunk {chunk_label})",
-                        chunk,
-                        *reason_lines,
-                        "## Final Verdict Instructions",
-                        f"You have now seen all {num_chunks} chunks of the diff. "
-                        "Review this final chunk and consider the findings across all chunks. "
-                        "Conclude with your final verdict as the last line: "
-                        "exactly 'VERDICT: APPROVED' "
-                        "or 'VERDICT: REJECTED - <one-line reason>'.",
-                    ]
-
-                c_parts: list[str] = []
-                async for event in self._stream(
-                    model,
+        review_cap = int(settings.get("review_max_tool_calls") or 40)
+        session_timeout = float(settings.get("review_session_timeout_seconds") or 900)
+        test_budget = float(settings.get("review_test_budget_seconds") or 600)
+        worktree = workspaces.worktree_path(project_root, story_id)
+        # one prompt, one capped diff: the reviewer reads the files the cap cut
+        # from the worktree (chunking is gone)
+        diff_chunks = chunk_diff(diff, max_chars=DIFF_CHUNK_SIZE)
+        not_shown = review_evidence.not_shown_paths(diff, diff_chunks)
+        changed_tests = review_evidence.runnable_tests(
+            test_command, review_evidence.changed_test_files(diff)
+        )
+        deny_globs = ToolPolicy.from_settings(settings).denied_patterns()
+        bus.publish(
+            "story_log", {"story_id": story_id, "text": "[code-review] reviewing diff\n"}
+        )
+        user_prompt = "\n".join(
+            [
+                "=== CODE REVIEW REQUEST ===",
+                f"# Story: {story_title}",
+                "## Spec",
+                story_spec,
+                verify_section,
+                *([impact_section] if impact_section else []),
+                *([branch_warning_section] if branch_warning_section else []),
+                *(
+                    [_reject_reasons_section(reject_reasons, reason_points)]
+                    if reject_reasons
+                    else []
+                ),
+                *([binding_section] if binding_section else []),
+                *([_operator_notes_section(operator_notes)] if operator_notes else []),
+                "## Diff (unified, vs base)",
+                diff_chunks[0] if diff_chunks else diff,
+                *(
                     [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": "\n".join(prompt_lines)},
-                    ],
-                    story_id,
-                    review_effort,
-                ):
-                    if isinstance(event, Delta):
-                        c_parts.append(event.text)
-                all_chunk_reviews.append((i, "".join(c_parts)))
-
-            # ---- dedicated whole-diff reasons judgement -----------------
-            # The chunks each saw only a slice, so none of them may judge
-            # the human's points. ONE extra call carries the reasons
-            # section plus the FULL uncapped diff, so every point is
-            # judged against everything. Its reply is stored under a
-            # heading but never verdict-parsed: the verdict still comes
-            # from the chunk assembly below (the reasons call is not asked
-            # for a verdict at all).
-            reasons_judgement = ""
-            if reason_points:
-                bus.publish(
-                    "story_log",
-                    {
-                        "story_id": story_id,
-                        "text": (
-                            "[code-review] judging reject reasons against "
-                            "the whole diff\n"
-                        ),
-                    },
-                )
-                reasons_prompt = "\n".join(
-                    [
-                        "=== CODE REASONS JUDGEMENT ===",
-                        f"# Story: {story_title}",
-                        _reject_reasons_section(reject_reasons, reason_points),
-                        "## Diff (unified, vs base — COMPLETE, all "
-                        f"{num_chunks} chunks)",
-                        diff,
-                        "Answer the points above. This reply is NOT a code "
-                        "review and needs no VERDICT line.",
+                        "## Changed files not shown above (read them from the worktree)",
+                        *(f"- {p}" for p in not_shown),
                     ]
-                )
-                r_parts: list[str] = []
-                async for event in self._stream(
-                    model,
-                    [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": reasons_prompt},
-                    ],
-                    story_id,
-                    review_effort,
-                ):
-                    if isinstance(event, Delta):
-                        r_parts.append(event.text)
-                reasons_judgement = "".join(r_parts)
-
-            # the verdict-retry turn replays the FINAL chunk's request, since
-            # the assembled review already carries every earlier chunk review
-            user_prompt = "\n".join(prompt_lines)
-
-            prior_parts = [
-                f"## Chunk {idx}/{num_chunks}\n{rev.strip()}"
-                for idx, rev in all_chunk_reviews[:-1]
+                    if not_shown
+                    else []
+                ),
+                "## Your turn",
+                "Inspect the change with your read-only tools. Do not give a verdict "
+                "yet: end with the MUTATIONS block described in your instructions.",
             ]
-            final_part = (
-                f"## Chunk {num_chunks}/{num_chunks} (Final)\n"
-                f"{all_chunk_reviews[-1][1].strip()}"
-            )
-            review = "\n\n".join(prior_parts + [final_part])
-            # the chunk assembly is the only verdict source; the reasons
-            # judgement is append-only storage, so a VERDICT line the model
-            # emits there anyway can never be parsed as this verdict (the
-            # reasons call is not asked for one)
-            verdict_review = review
-            if reasons_judgement:
-                review = (
-                    f"{review.strip()}\n\n"
-                    "## Human reject reasons — judged against the whole diff\n\n"
-                    f"{reasons_judgement.strip()}"
-                )
-        verdict, reason = parse_verdict(verdict_review)
-        if verdict is None:
-            # A review with no parsable VERDICT line used to be fail-open
-            # approved at the human gate — a thinking-only or truncated reply
-            # then read as an endorsement. Give the reviewer exactly one
-            # corrective retry (multi-turn, so we don't replay an identical
-            # prompt that would reproduce the same truncation) and still
-            # reject if it stays verdict-less: a human can approve.
-            retry_prompt = "\n".join(
-                [
-                    "=== CODE REVIEW VERDICT REQUIRED ===",
-                    "Your previous reply contained no parsable verdict line, so "
-                    "it cannot be recorded as an approval.",
-                    "Reply again, concluding with exactly one line "
-                    "'VERDICT: APPROVED' or 'VERDICT: REJECTED - <one-line reason>'.",
-                    "That final line is mandatory; nothing may follow it.",
-                ]
-            )
-            bus.publish(
-                "story_log",
-                {"story_id": story_id, "text": "[code-review] no verdict; asking for one\n"},
-            )
-            retry_parts: list[str] = []
-            async for event in self._stream(
-                model,
+        )
+        turn = dict(
+            model=model, worktree=worktree, settings=settings, effort=review_effort,
+            cap=review_cap, timeout=session_timeout,
+        )
+        ledger = review_evidence.Ledger(changed_tests=changed_tests)
+        flags = review_evidence.SessionFlags()
+        review_a = c_text = retry_text = ""
+        verdict = reason = None
+        try:
+            # ---- phase A: inspect (model slot) ---------------------------
+            a = await self._review_turn(
+                story_id,
                 [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
-                    {"role": "assistant", "content": review},
-                    {"role": "user", "content": retry_prompt},
                 ],
-                story_id,
-                review_effort,
-            ):
-                if isinstance(event, Delta):
-                    retry_parts.append(event.text)
-            retry_review = "".join(retry_parts)
-            review = (
-                f"{review.strip()}\n\n## Retry after missing verdict\n\n{retry_review.strip()}"
+                tools_on=True, phase="code_review", **turn,
             )
-            verdict, reason = parse_verdict(retry_review)
-            if verdict is None:
-                with session_scope(self.engine) as db:
-                    record_event(
-                        db,
-                        story_id,
-                        "note",
-                        {"reason": "code review produced no verdict", "by": "code-reviewer"},
-                    )
-                self._finish(
-                    story_id,
-                    StoryStatus.HUMAN_REVIEW,
-                    StoryStatus.AI_REVIEW,
-                    ai_review=review,
-                    ai_verdict="rejected",
+            review_a = a.text
+            flags.timed_out, flags.turn_cap = a.timed_out, a.turn_cap
+            if not (flags.timed_out or flags.turn_cap):
+                # ---- phase B: evidence (test slot, no model slot) ------------
+                ledger.mutations_block, entries = review_evidence.parse_mutations(review_a)
+                await self._review_evidence(
+                    story_id, ledger, entries,
+                    worktree=worktree, project_root=project_root,
+                    test_command=test_command, deny_globs=deny_globs,
+                    budget=test_budget, settings=settings,
                 )
-                return
+                # ---- phase C: verdict (model slot) ---------------------------
+                c_messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                    {"role": "assistant", "content": review_a or "(no output)"},
+                    {
+                        "role": "user",
+                        "content": "\n".join(
+                            [
+                                "=== REVIEW EVIDENCE ===",
+                                review_evidence.render_section(ledger),
+                                "Only this ledger counts as evidence. Conclude with your "
+                                "verdict as the last line: exactly 'VERDICT: APPROVED' or "
+                                "'VERDICT: REJECTED - <one-line reason>'.",
+                            ]
+                        ),
+                    },
+                ]
+                c = await self._review_turn(
+                    story_id, c_messages, tools_on=True, phase="code_review_verdict", **turn
+                )
+                flags.timed_out, flags.turn_cap = c.timed_out, c.turn_cap
+                c_text = c.text
+                verdict, reason = parse_verdict(c_text)
+                if verdict is None and not (flags.timed_out or flags.turn_cap):
+                    # A review with no parsable VERDICT line used to be
+                    # fail-open approved at the human gate. Give the reviewer
+                    # exactly one corrective retry (multi-turn, so we don't
+                    # replay an identical prompt that would reproduce the same
+                    # truncation) and still reject if it stays verdict-less: a
+                    # human can approve.
+                    bus.publish(
+                        "story_log",
+                        {
+                            "story_id": story_id,
+                            "text": "[code-review] no verdict; asking for one\n",
+                        },
+                    )
+                    retry_prompt = "\n".join(
+                        [
+                            "=== CODE REVIEW VERDICT REQUIRED ===",
+                            "Your previous reply contained no parsable verdict line, so "
+                            "it cannot be recorded as an approval.",
+                            "Reply again, concluding with exactly one line "
+                            "'VERDICT: APPROVED' or 'VERDICT: REJECTED - <one-line reason>'.",
+                            "That final line is mandatory; nothing may follow it.",
+                        ]
+                    )
+                    r = await self._review_turn(
+                        story_id,
+                        [
+                            *c_messages,
+                            {"role": "assistant", "content": c_text or "(no output)"},
+                            {"role": "user", "content": retry_prompt},
+                        ],
+                        tools_on=False, phase="code_review_nudge", **turn,
+                    )
+                    retry_text = r.text
+                    verdict, reason = parse_verdict(retry_text)
+        except _ReviewPodGone:
+            ledger.pod_unavailable = True
+        review = "\n\n".join(
+            part
+            for part in (
+                review_a.strip(),
+                # the ledger's own words: rendered from what Fubala ran
+                review_evidence.render_section(ledger).strip(),
+                f"## Verdict turn\n\n{c_text.strip()}" if c_text.strip() else "",
+                (
+                    f"## Retry after missing verdict\n\n{retry_text.strip()}"
+                    if retry_text.strip()
+                    else ""
+                ),
+            )
+            if part
+        )
+        if verdict is None and not (
+            flags.timed_out or flags.turn_cap or ledger.pod_unavailable
+        ):
+            with session_scope(self.engine) as db:
+                record_event(
+                    db,
+                    story_id,
+                    "note",
+                    {"reason": "code review produced no verdict", "by": "code-reviewer"},
+                )
+            self._finish(
+                story_id,
+                StoryStatus.HUMAN_REVIEW,
+                StoryStatus.AI_REVIEW,
+                ai_review=review,
+                ai_verdict="rejected",
+            )
+            return
         # human reject reasons: an unanswered, explicitly-not-addressed or
         # hedged point overrides even an approving verdict — the reviewer
         # checked the human's points and left one unhandled. A reply with no
@@ -6934,6 +7040,13 @@ class StoryRunner:
             unaddressed = _unaddressed_reason(review, reason_points)
             if unaddressed is not None:
                 verdict, reason = "rejected", unaddressed
+        decision, cause = review_evidence.decide(verdict, ledger, flags)
+        if decision == "incomplete":
+            review = review.replace(
+                review_evidence.render_section(ledger).strip(),
+                review_evidence.render_section(ledger, cause).strip(),
+                1,
+            )
         if verdict == "rejected":
             # loop guard: a coder/reviewer pair that keeps disagreeing over
             # the same unanswered point must not ping-pong forever — after
@@ -7031,6 +7144,30 @@ class StoryRunner:
             # exactly the checks that actually failed.
             self._maybe_auto_code_gate(story_id, review, verdict)
             return
+        if decision == "incomplete":
+            # the review could not be completed with evidence: a human decides.
+            # Never requeued to the coder (nothing was found wrong), never
+            # approved, and the auto code gate fails `ai_code_review_approved`.
+            with session_scope(self.engine) as db:
+                record_event(
+                    db,
+                    story_id,
+                    "note",
+                    {
+                        "reason": f"code review incomplete: {cause}",
+                        "by": "code-reviewer",
+                        "review_incomplete": True,
+                    },
+                )
+            self._finish(
+                story_id,
+                StoryStatus.HUMAN_REVIEW,
+                StoryStatus.AI_REVIEW,
+                ai_review=review,
+                ai_verdict="incomplete",
+            )
+            self._maybe_auto_code_gate(story_id, review, "incomplete")
+            return
         self._finish(
             story_id,
             StoryStatus.HUMAN_REVIEW,
@@ -7046,6 +7183,360 @@ class StoryRunner:
         # the failed checks named in a note. Runs ONLY here, at this
         # transition — never on land-poller bounces.
         self._maybe_auto_code_gate(story_id, review, verdict)
+
+    # ---- code review as a tool-using session ------------------------------
+
+    async def _ensure_review_pod(self, story_id: str, settings: dict) -> None:
+        """The review's worker pod, placed like the spec phase's: built lazily,
+        behind the backend-node fallback gate (requeues when the dev node is
+        full). In pod mode a pod that cannot be had is PodUnavailable: it never
+        degrades to a local run."""
+        mode = str(settings.get("run_executor") or "")
+        if mode not in ("verify", "pod"):
+            return
+        if story_id not in self._executors:
+            executor = self._make_executor(story_id, asyncio.get_running_loop())
+            if executor is not None:
+                self._executors[story_id] = executor
+        executor = self._executors.get(story_id)
+        if mode == "pod" and executor is None:
+            # preflight failed (no worker image, POD_* env missing): the API
+            # pod must not run the review
+            self._review_pod_unavailable(story_id, None, "no worker pod executor")
+        if story_id not in self._gated:
+            if not await self._fallback_gate(story_id):
+                raise _HeadlessRequeued()  # requeued: the dev node is full
+            self._gated.add(story_id)
+        if executor is not None and executor.mode == "pod" and executor.disabled:
+            self._review_pod_unavailable(story_id, executor, "no worker pod could be had")
+
+    def _review_pod_unavailable(
+        self, story_id: str, executor: pods.PodExecutor | None, cause: str
+    ) -> None:
+        """PodUnavailable in pod mode: requeue the story once (raises
+        _HeadlessRequeued); the second time raise _ReviewPodGone so the review
+        ends `incomplete`. Never runs anything locally."""
+        if executor is None:
+            gone = story_id not in self._running
+        else:
+            gone = not self._still_this_run(story_id, executor)
+        if gone:
+            raise _HeadlessAborted()  # cancel took the story over
+        attempt = self._status_flag_count(story_id, "review_pod_requeue") + 1
+        if attempt > REVIEW_POD_REQUEUE_CAP:
+            raise _ReviewPodGone()
+        note = redact_secrets(
+            f"worker pod unavailable during the code review: {cause}; "
+            f"requeued {attempt}/{REVIEW_POD_REQUEUE_CAP}"
+        )
+        with session_scope(self.engine) as db:
+            story = db.get(Story, story_id)
+            if story is None or story.status != StoryStatus.AI_REVIEW:
+                raise _HeadlessAborted()
+            story.status = StoryStatus.QUEUED
+            story.error = None
+            story.queued_at = utcnow()
+            story.updated_at = utcnow()
+            db.add(story)
+            record_event(
+                db,
+                story_id,
+                "status",
+                {
+                    "from": StoryStatus.AI_REVIEW,
+                    "to": StoryStatus.QUEUED,
+                    "note": note,
+                    "review_pod_requeue": True,
+                    "attempt": attempt,
+                },
+            )
+            db.add(StoryNote(story_id=story_id, body=note[:8192], author="fubala"))
+            payload = story_payload(story)
+        bus.publish("story", {"story": payload})
+        log.info("story %s requeued: review pod unavailable (%d)", story_id, attempt)
+        raise _HeadlessRequeued()
+
+    async def _review_turn(
+        self,
+        story_id: str,
+        messages: list[dict],
+        *,
+        model: str,
+        worktree: Path,
+        settings: dict,
+        effort: str | None,
+        cap: int,
+        timeout: float,
+        tools_on: bool,
+        phase: str,
+    ) -> _ReviewTurn:
+        """One read-only review session on the story worktree, under one model
+        slot (released before the next phase takes a test slot)."""
+        self._record_phase(story_id, phase, model, effort)
+        cli_target = self._claude_code_target(model)
+        async with self._model_slot(story_id):
+            if cli_target is not None:
+                return await self._review_cli_turn(
+                    story_id, cli_target, messages, worktree, settings,
+                    effort=effort, cap=cap, timeout=timeout, tools_on=tools_on, phase=phase,
+                )
+            return await self._review_agent_turn(
+                story_id, model, messages, worktree, settings,
+                effort=effort, cap=cap, timeout=timeout, tools_on=tools_on,
+            )
+
+    async def _review_cli_turn(
+        self, story_id, target, messages, worktree, settings, *,
+        effort, cap, timeout, tools_on, phase,
+    ) -> _ReviewTurn:
+        """Claude Max: one `claude -p` session with Read, Grep, Glob (no tools
+        for the nudge). In pod mode it runs in the worker pod and never
+        locally; otherwise (local dev) as a child process in the worktree."""
+        from .providers import claude_code as cc
+
+        resolved, key = target
+        cli_tools = READ_ONLY_CLI_TOOLS if tools_on else ""
+        max_turns = cap if tools_on else None
+        await self._ensure_review_pod(story_id, settings)
+        pod_ex = self._executors.get(story_id)
+        in_pod = (
+            str(settings.get("run_executor") or "") == "pod"
+            and pod_ex is not None
+            and pod_ex.mode == "pod"
+        )
+        if in_pod:
+            graph_on = bool(cli_tools) and self._code_graph_project(story_id)[1]
+            argv, env, prompt = cc.build_cli_session(
+                resolved, key, messages, cli_tools=cli_tools, max_turns=max_turns,
+                effort=effort,
+                mcp_config=code_graph.pod_mcp_config_json(pods.REPO_DIR) if graph_on else None,
+            )
+            self._set_watchdog_floor(story_id, timeout + pods.EXEC_MARGIN + 300.0)
+            try:
+                rc, out, err = await asyncio.to_thread(
+                    pod_ex.run_cli_session, argv, env, prompt, timeout, worktree
+                )
+            except pods.PodUnavailable:
+                self._review_pod_unavailable(story_id, pod_ex, "the session could not start")
+            except pods.PodRunLost as e:
+                if self._requeue_pod_lost(story_id, str(e), pod_ex):
+                    raise _HeadlessRequeued() from None
+                if self._still_this_run(story_id, pod_ex):
+                    self._fail_infrastructure(story_id, f"worker pod lost mid-run: {e}")
+                raise _HeadlessAborted() from None
+            finally:
+                self._clear_watchdog_floor(story_id)
+            if rc == 124:
+                return _ReviewTurn(timed_out=True)
+            text, usage = cc.parse_cli_result(
+                resolved.provider.id, key, rc, out, err, allow_turn_cap=True
+            )
+            bus.publish("story_log", {"story_id": story_id, "text": text})
+            return _ReviewTurn(text=text, turn_cap=usage.turn_cap)
+        tag = f"{story_id}-{phase}"
+        try:
+            mcp_config = await self._graph_mcp(story_id, worktree, tag) if cli_tools else None
+            text, usage = await cc.run_cli_agent(
+                resolved, key, messages, cwd=str(worktree), cli_tools=cli_tools,
+                max_turns=max_turns, timeout=timeout, effort=effort,
+                mcp_config=mcp_config, allow_turn_cap=True,
+            )
+        except cc.CliTimeout:
+            return _ReviewTurn(timed_out=True)
+        finally:
+            code_graph.cleanup(tag)
+        bus.publish("story_log", {"story_id": story_id, "text": text})
+        return _ReviewTurn(text=text, turn_cap=usage.turn_cap)
+
+    async def _review_agent_turn(
+        self, story_id, model, messages, worktree, settings, *,
+        effort, cap, timeout, tools_on,
+    ) -> _ReviewTurn:
+        """Other models: Fubala's tool loop over a NON-writable ToolBox rooted
+        at the worktree (HTTP plus in-process file reads, no process)."""
+        policy = ToolPolicy.from_settings(settings)
+        policy.max_tool_calls = cap
+        policy.timeout_seconds = timeout
+        toolbox = ToolBox(
+            project_root=str(worktree), deny_globs=policy.denied_patterns(), writable=False
+        )
+        guarded = GuardedExecutor(
+            toolbox, policy, watchdog_floor=self._watchdog_floor_stamp(story_id)
+        )
+        started = time.monotonic()
+        result = await run_agent(
+            self.gateway,
+            model=model,
+            messages=messages,
+            tools=(toolbox.schemas() or None) if tools_on else None,
+            execute=guarded if tools_on else None,
+            on_delta=lambda text: bus.publish(
+                "story_log", {"story_id": story_id, "text": text}
+            ),
+            on_tool=activity_tool_hook(self.engine, story_id),
+            on_progress=self._progress_hook(story_id, "code_review"),
+            max_tool_calls=cap if tools_on else None,
+            timeout_seconds=timeout if tools_on else None,
+            max_output_tokens_cap=int(settings.get("agent_max_output_tokens_cap", 32768) or 0)
+            or None,
+            effort=effort,
+        )
+        return _ReviewTurn(
+            text=result.text if result.complete else "",
+            timed_out=tools_on and time.monotonic() - started > timeout,
+            turn_cap=tools_on and result.tool_calls >= cap,
+        )
+
+    async def _review_evidence(
+        self,
+        story_id: str,
+        ledger: review_evidence.Ledger,
+        entries: list[dict],
+        *,
+        worktree: Path,
+        project_root: str,
+        test_command: str,
+        deny_globs: tuple[str, ...],
+        budget: float,
+        settings: dict,
+    ) -> None:
+        """Phase B: the changed tests, then at most MAX_MUTATIONS mutations,
+        run by Fubala under one test slot and `budget` seconds, recorded in
+        `ledger`. The model slot is not held (the sessions on either side
+        release theirs)."""
+        valid: list[tuple[review_evidence.Mutation, bytes]] = []
+        for entry in entries[: review_evidence.MAX_MUTATIONS]:
+            mutation, data, why = await asyncio.to_thread(
+                review_evidence.validate_mutation, entry, worktree, deny_globs
+            )
+            if mutation is None or data is None:
+                ledger.refused.append((entry, why or "refused"))
+            else:
+                valid.append((mutation, data))
+        if not test_command:
+            ledger.no_test_command = True
+            return
+        if not ledger.changed_tests and not valid:
+            return
+        await self._ensure_review_pod(story_id, settings)
+        executor = self._executors.get(story_id)
+        if executor is not None and executor.disabled:
+            executor = None  # verify mode only: pod mode raised above
+        bus.publish(
+            "story_log", {"story_id": story_id, "text": "[code-review] running evidence\n"}
+        )
+        async with self._test_slot(story_id):
+            self._set_watchdog_floor(story_id, budget + pods.EXEC_MARGIN + 300.0)
+            try:
+                try:
+                    await asyncio.to_thread(
+                        self._review_commands, story_id, ledger, valid, worktree,
+                        project_root, test_command, budget, executor,
+                    )
+                except pods.PodUnavailable:
+                    if (
+                        executor is None
+                        or executor.mode == "pod"
+                        or pods.local_fallback_disabled(executor.settings)
+                    ):
+                        self._review_pod_unavailable(
+                            story_id, executor, "the evidence run could not start"
+                        )
+                    ledger.test_run, ledger.mutations = None, []
+                    ledger.over_budget = False
+                    await asyncio.to_thread(
+                        self._review_commands, story_id, ledger, valid, worktree,
+                        project_root, test_command, budget, None,
+                    )
+            finally:
+                self._clear_watchdog_floor(story_id)
+
+    def _review_commands(
+        self,
+        story_id: str,
+        ledger: review_evidence.Ledger,
+        valid: list[tuple[review_evidence.Mutation, bytes]],
+        worktree: Path,
+        project_root: str,
+        test_command: str,
+        budget: float,
+        executor: pods.PodExecutor | None,
+    ) -> None:
+        """Blocking part of phase B. Pod: everything in the worker pod
+        (PodUnavailable propagates). In-process (local dev only): a scratch
+        detached checkout of the snapshot commit, removed in a `finally`."""
+        deadline = time.monotonic() + budget
+        scratch: Path | None = None
+        env = None
+        if executor is not None and executor.is_pod:
+            executor.prepare()
+            executor.sync_workspace(worktree)
+
+            def run_tests(command: str, timeout: float) -> tuple[int, str]:
+                return executor.run(pods.add_maxprocesses(command), "", None, timeout)
+
+            def run_mutation(m, data: bytes, command: str, timeout: float) -> tuple[int, str]:
+                return executor.run_mutation(m.path, data, command, timeout)
+
+        else:
+            _, sha = workspaces.snapshot_bundle(worktree, story_id)
+            scratch = Path(tempfile.mkdtemp(prefix="fubala-review-"))
+            env = workspaces.scrub_child_env(
+                {**os.environ, **workspaces.shared_cache_env(project_root)}
+            )
+            local = procs.LocalExecutor(scratch, story_id)
+            try:
+                workspaces._git(worktree, "worktree", "add", "--detach", str(scratch), sha)
+            except BaseException:
+                shutil.rmtree(scratch, ignore_errors=True)
+                raise
+
+            def run_tests(command: str, timeout: float) -> tuple[int, str]:
+                return local.run(command, "", env, timeout)
+
+            def run_mutation(m, data: bytes, command: str, timeout: float) -> tuple[int, str]:
+                target = scratch / m.path
+                try:
+                    target.write_bytes(data)
+                    return local.run(command, "", env, timeout)
+                finally:
+                    with contextlib.suppress(workspaces.WorkspaceError):
+                        workspaces._git(scratch, "checkout", "--", m.path)
+
+        try:
+            if ledger.changed_tests:
+                command = review_evidence.scope_command(test_command, ledger.changed_tests)
+                rc, out = run_tests(command, max(1.0, deadline - time.monotonic()))
+                ledger.test_run = review_evidence.TestRun(
+                    command, rc, list(ledger.changed_tests), out
+                )
+                if rc != 0:
+                    return  # mutations on a red baseline prove nothing
+            for mutation, data in valid:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    ledger.over_budget = True
+                    return
+                command = review_evidence.scope_command(
+                    test_command,
+                    review_evidence.runnable_tests(test_command, mutation.tests)
+                    or ledger.changed_tests,
+                )
+                rc, out = run_mutation(mutation, data, command, left)
+                ledger.mutations.append(
+                    review_evidence.MutationRun(
+                        mutation, review_evidence.mutation_status(rc), rc, command, out
+                    )
+                )
+        finally:
+            if scratch is not None:
+                try:
+                    workspaces._git(worktree, "worktree", "remove", "--force", str(scratch))
+                except workspaces.WorkspaceError:
+                    pass
+                shutil.rmtree(scratch, ignore_errors=True)
+                with contextlib.suppress(workspaces.WorkspaceError):
+                    workspaces._git(worktree, "worktree", "prune")
 
     def _maybe_auto_code_gate(
         self, story_id: str, review: str, verdict: str | None

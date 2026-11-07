@@ -63,6 +63,17 @@ HEADLESS_TIMEOUT_DEFAULT = 2400.0
 HEADLESS_TIMEOUT_MIN = 30.0
 HEADLESS_TIMEOUT_MAX = 7200.0
 
+# Bounds for `headless_test_timeout_seconds`: the cut for a targeted test run
+# the CLI starts itself (BASH_DEFAULT_TIMEOUT_MS = BASH_MAX_TIMEOUT_MS). The
+# full suite never runs in the session: the coder ends its turn with the
+# marker below and the runner runs it outside the model slot.
+HEADLESS_TEST_TIMEOUT_DEFAULT = 120.0
+HEADLESS_TEST_TIMEOUT_MIN = 10.0
+HEADLESS_TEST_TIMEOUT_MAX = 900.0
+
+# the last non-empty line of the final text that asks for the full suite
+RUN_TESTS_MARKER = "FUBALA_RUN_TESTS"
+
 # API_TIMEOUT_MS handed to the child, as pinned by the spec. At the default
 # (and up to a 3000 s headless_timeout_seconds) the CLI never times itself
 # out first; above that our killpg still bounds the child — the child env
@@ -115,13 +126,18 @@ class HeadlessOutcome:
       fix      — a real coder failure (non-zero exit, no result event, turn
                  cap, or timeout): the story must go back to the coder with
                  the reason, i.e. a fix round exactly like a pump coder error.
+      run_tests — exit 0, a result event, under the turn cap, and the final
+                 text ends with RUN_TESTS_MARKER: the coder wants the full
+                 suite run outside the session. `session_id` resumes the CLI
+                 session; `config_dir` is the kept CLAUDE_CONFIG_DIR (the
+                 caller removes it).
       transient — 429/rate-limit: a usage-limit answer in the stream
                  (isApiErrorMessage + marker; `limit_note`/`limit_reset_at`
                  carry the stated limit and reset time) or 429/rate-limit
                  stderr. Requeue with backoff, do NOT burn a fix round.
     """
 
-    outcome: str  # "ok" | "fix" | "transient"
+    outcome: str  # "ok" | "fix" | "transient" | "run_tests"
     reason: str | None = None
     num_turns: int | None = None
     duration_ms: int | None = None
@@ -138,6 +154,12 @@ class HeadlessOutcome:
     limit_reset_at: datetime | None = None
     # A/B counter: mcp__code-review-graph__* tool uses in the session
     graph_tool_calls: int = 0
+    # the CLI session id (init/result event) and, on a run_tests outcome, the
+    # kept CLAUDE_CONFIG_DIR the resume reuses
+    session_id: str | None = None
+    config_dir: str | None = None
+    # targeted test runs the CLI cut at the short timeout
+    targeted_cuts: int = 0
 
 
 @dataclass
@@ -151,6 +173,8 @@ class HeadlessConfig:
     small_fast_model: str | None = None
     max_turns: int = 40
     timeout_seconds: float = HEADLESS_TIMEOUT_DEFAULT
+    # cut for a targeted test run inside the session (see _claude_env)
+    test_timeout_seconds: float = HEADLESS_TEST_TIMEOUT_DEFAULT
     # per-story artifact dir for kept transcripts (the app's data dir); when
     # None no transcript is kept (unit tests without an app data dir)
     artifacts_dir: str | None = None
@@ -230,6 +254,10 @@ def _claude_env(config: HeadlessConfig) -> dict[str, str]:
     env["ANTHROPIC_MODEL"] = strip_provider_prefix(config.model)
     env["ANTHROPIC_SMALL_FAST_MODEL"] = flash_model_for(config)
     env["API_TIMEOUT_MS"] = str(API_TIMEOUT_MS)
+    # both equal, so the model cannot raise the limit per call
+    cut_ms = str(int(float(config.test_timeout_seconds) * 1000))
+    env["BASH_DEFAULT_TIMEOUT_MS"] = cut_ms
+    env["BASH_MAX_TIMEOUT_MS"] = cut_ms
     env["DISABLE_TELEMETRY"] = "1"
     env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
     return env
@@ -258,6 +286,7 @@ def with_rules(
     *,
     test_command: str | None = None,
     verify_command: str | None = None,
+    test_timeout_seconds: float = HEADLESS_TEST_TIMEOUT_DEFAULT,
 ) -> str:
     """Append the tool-neutral rules to a runner-built CODE REQUEST.
 
@@ -289,8 +318,15 @@ def with_rules(
             "While working, run the project's test command for the files you touch."
         )
     if verify_command:
+        lines.append("Never run the full suite in the session.")
         lines.append(
-            f"Run the full verify command before you finish: `{verify_command}`."
+            f"To get the full verify command run (`{verify_command}`), end your "
+            f"turn with {RUN_TESTS_MARKER} alone as the last line (no backticks); "
+            "Fubala runs it and resumes this session with the result."
+        )
+        lines.append(
+            "Single-file test runs are allowed and are cut at "
+            f"{int(float(test_timeout_seconds))} s."
         )
     else:
         lines.append("Run the full verify command before you finish.")
@@ -334,7 +370,9 @@ def build_prompt(
     return "\n".join(parts)
 
 
-def child_argv(prompt: str, config: HeadlessConfig) -> list[str]:
+def child_argv(
+    prompt: str, config: HeadlessConfig, resume_session_id: str | None = None
+) -> list[str]:
     """The exact argv the CLI is invoked with (stream-json + verbose for the
     live watch, AskUserQuestion disallowed so the child can never block on a
     question nobody answers)."""
@@ -352,6 +390,8 @@ def child_argv(prompt: str, config: HeadlessConfig) -> list[str]:
         "--max-turns",
         str(max(1, int(config.max_turns))),
     ]
+    if resume_session_id:
+        argv += ["--resume", resume_session_id]
     if config.oauth and config.effort:
         argv += ["--effort", config.effort]
     if config.mcp_config:
@@ -600,6 +640,27 @@ def tool_use_summaries(event: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _is_test_cut(event: dict[str, Any]) -> bool:
+    """A tool_result flagged is_error whose text says the command timed out:
+    the CLI cut a targeted run at BASH_MAX_TIMEOUT_MS."""
+    if event.get("type") != "user":
+        return False
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return False
+    for block in _content_blocks(message):
+        if block.get("type") != "tool_result" or not block.get("is_error"):
+            continue
+        content = block.get("content")
+        if isinstance(content, list):
+            content = " ".join(
+                str(b.get("text", "")) for b in content if isinstance(b, dict)
+            )
+        if isinstance(content, str) and "timed out" in content.lower():
+            return True
+    return False
+
+
 class StreamReader:
     """Per-line stream-json handling, shared by the local and the pod path:
     parse, keep the `result` event, relay tool_use summaries and the
@@ -612,16 +673,30 @@ class StreamReader:
         self.relay = relay
         self.events: list[dict[str, Any]] = []
         self.result_event: dict[str, Any] | None = None
+        self.session_id: str | None = None
+        self.targeted_cuts = 0
+
+    def _note_session(self, event: dict[str, Any]) -> None:
+        value = event.get("session_id")
+        if isinstance(value, str) and value:
+            self.session_id = value
 
     def feed(self, line: str) -> None:
         parsed = parse_stream_line(line)
         if parsed is None:
             return
         self.events.append(parsed)
-        if parsed.get("type") == "result":
+        kind = parsed.get("type")
+        if kind == "system" and parsed.get("subtype") == "init":
+            self._note_session(parsed)
+        if kind == "result":
             # the final event: parsed for turns/usage/result by map_outcome
+            self._note_session(parsed)
             self.result_event = parsed
             return
+        if _is_test_cut(parsed):
+            self.targeted_cuts += 1
+            self.relay({"type": "test_cut"})
         for summary in tool_use_summaries(parsed):
             self.relay(summary)
         summary_event = summarize_stream_event(parsed, self.secrets)
@@ -655,6 +730,14 @@ def timeout_outcome(duration_ms: int) -> HeadlessOutcome:
     )
 
 
+def _last_line(text: str) -> str:
+    """The last non-empty line of `text`, stripped ("" for none)."""
+    for line in reversed(text.splitlines()):
+        if line.strip():
+            return line.strip()
+    return ""
+
+
 def map_outcome(
     *,
     exit_code: int | None,
@@ -666,6 +749,28 @@ def map_outcome(
 ) -> HeadlessOutcome:
     """Map a finished child (exit code, stderr, parsed stream) to an outcome.
     Shared by the local and the pod path."""
+    outcome = _map_outcome(
+        exit_code=exit_code,
+        stderr=stderr,
+        stream=stream,
+        config=config,
+        duration_ms=duration_ms,
+        transcript_path=transcript_path,
+    )
+    outcome.session_id = stream.session_id
+    outcome.targeted_cuts = stream.targeted_cuts
+    return outcome
+
+
+def _map_outcome(
+    *,
+    exit_code: int | None,
+    stderr: str,
+    stream: StreamReader,
+    config: HeadlessConfig,
+    duration_ms: int,
+    transcript_path: Path | None,
+) -> HeadlessOutcome:
     secrets = stream.secrets
     result_event = stream.result_event
     if exit_code != 0:
@@ -743,8 +848,18 @@ def map_outcome(
     final_text = result_event.get("result")
     if not isinstance(final_text, str):
         final_text = ""
+    wants_tests = _last_line(final_text) == RUN_TESTS_MARKER
+    if wants_tests and not stream.session_id:
+        return HeadlessOutcome(
+            outcome="fix",
+            reason=f"{RUN_TESTS_MARKER} requested but the stream carried no session id",
+            num_turns=num_turns,
+            duration_ms=duration_ms,
+            exit_code=exit_code,
+            transcript_path=str(transcript_path) if transcript_path else None,
+        )
     return HeadlessOutcome(
-        outcome="ok",
+        outcome="run_tests" if wants_tests else "ok",
         num_turns=num_turns,
         duration_ms=duration_ms,
         usage=_usage_from(result_event),
@@ -808,8 +923,14 @@ def run_code_stage(
     prompt: str,
     config: HeadlessConfig,
     on_event: Callable[[dict[str, Any]], None] | None = None,
+    resume_session_id: str | None = None,
+    config_dir: str | Path | None = None,
 ) -> HeadlessOutcome:
     """Run one headless CODE stage and map the child's fate to an outcome.
+
+    With `resume_session_id` and `config_dir` the run resumes that CLI session
+    (`--resume`) in the kept config dir. On a `run_tests` outcome the config
+    dir is kept and its path returned in the outcome; the caller removes it.
 
     Synchronous on purpose: the runner calls it via `asyncio.to_thread` (the
     same pattern as git worktree add/del and verify), keeping the event loop
@@ -821,10 +942,16 @@ def run_code_stage(
     stream = StreamReader(secrets, safe_relay(on_event))
 
     started = time.monotonic()
-    config_dir = Path(tempfile.mkdtemp(prefix=f"fubala-headless-{_safe(story_id)}-"))
+    if config_dir is not None:
+        config_dir = Path(config_dir)
+    else:
+        config_dir = Path(
+            tempfile.mkdtemp(prefix=f"fubala-headless-{_safe(story_id)}-")
+        )
     env = _child_env(config)
     env["CLAUDE_CONFIG_DIR"] = str(config_dir)
-    argv = child_argv(prompt, config)
+    argv = child_argv(prompt, config, resume_session_id)
+    finished = False
     transcript_path: Path | None = None
     stderr = ""
     child: subprocess.Popen | None = None
@@ -893,6 +1020,7 @@ def run_code_stage(
             stderr_reader.join(timeout=5)
             stdout_reader.join(timeout=5)
             stderr = b"".join(stderr_chunks).decode("utf-8", "replace")
+            finished = True
         except subprocess.TimeoutExpired:
             reap_reason = "timeout"
             _kill_process_group(child.pid)
@@ -929,9 +1057,10 @@ def run_code_stage(
                 )
         except OSError:
             transcript_path = None
-        shutil.rmtree(config_dir, ignore_errors=True)
+        if not finished:
+            shutil.rmtree(config_dir, ignore_errors=True)
 
-    return map_outcome(
+    outcome = map_outcome(
         exit_code=child.returncode,
         stderr=stderr,
         stream=stream,
@@ -939,3 +1068,8 @@ def run_code_stage(
         duration_ms=int((time.monotonic() - started) * 1000),
         transcript_path=transcript_path,
     )
+    if outcome.outcome == "run_tests":
+        outcome.config_dir = str(config_dir)
+    else:
+        shutil.rmtree(config_dir, ignore_errors=True)
+    return outcome

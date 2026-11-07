@@ -678,7 +678,7 @@ def test_watchdog_cancels_and_requeues_hung_stream(tmp_path, monkeypatch):
         assert current["status"] != "failed", current.get("error")
 
 
-def test_verify_stage_runs_fix_round_and_gates_merge(tmp_path, monkeypatch):
+def test_verify_stage_runs_fix_round_and_gates_merge(tmp_path, monkeypatch, legacy_review):
     """Verify command fails first (marker file missing), the coder fixes it in
     a bounded fix round, verify passes, and the story carries the result."""
     from fastapi.testclient import TestClient
@@ -1152,7 +1152,7 @@ def test_fix_round_gets_fresh_time_budget(tmp_path, monkeypatch):
         assert content.startswith("[tool output"), content
 
 
-def test_red_verify_forces_code_review_rejection(tmp_path, monkeypatch):
+def test_red_verify_forces_code_review_rejection(tmp_path, monkeypatch, legacy_review):
     """A red verify must never reach the human gate as ai_verdict="approved",
     even when the code reviewer replies VERDICT: APPROVED (fix rounds already
     exhausted). The story lands at human_review marked rejected, with a note
@@ -1251,7 +1251,7 @@ def test_red_verify_forces_code_review_rejection(tmp_path, monkeypatch):
         assert res.status_code == 200 and res.json()["status"] == "done"
 
 
-def test_missing_verdict_twice_rejects_at_human_gate(tmp_path, monkeypatch):
+def test_missing_verdict_twice_rejects_at_human_gate(tmp_path, monkeypatch, legacy_review):
     """Test A: a code review with no parsable VERDICT line — even after its
     single corrective retry — must not land the story as ai_verdict="approved".
     It arrives at human_review marked rejected with a note saying so."""
@@ -1340,7 +1340,7 @@ def test_missing_verdict_twice_rejects_at_human_gate(tmp_path, monkeypatch):
         assert "## Retry after missing verdict" in (current["ai_review"] or "")
 
 
-def test_missing_verdict_retry_recovers_approval(tmp_path, monkeypatch):
+def test_missing_verdict_retry_recovers_approval(tmp_path, monkeypatch, legacy_review):
     """Test B: the first code review carries no verdict, the corrective retry
     replies 'VERDICT: APPROVED' — the story then reaches human_review approved,
     with exactly one retry whose messages carry the nudge and the prior reply."""
@@ -2337,7 +2337,7 @@ def test_code_reject_retry_that_commits_is_reviewed_normally(tmp_path, monkeypat
         ), "a retry fired although the rerun already committed"
 
 
-def test_code_review_must_address_each_human_reject_reason(tmp_path, monkeypatch):
+def test_code_review_must_address_each_human_reject_reason(tmp_path, monkeypatch, legacy_review):
     """AC3: with code-gate reject reasons on record, the review prompt
     carries them plus the per-point reply contract. A reviewer who approves
     but leaves a reason explicitly NOT ADDRESSED is overridden to rejected

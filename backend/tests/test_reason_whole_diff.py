@@ -1,16 +1,15 @@
 """The AI code review judges each human reject reason against the WHOLE
-diff, never against one chunk of it.
+diff, never against a slice of it.
 
 Incident (merge train 50a9f97c): a rework whose fix lived in an earlier
-chunk was marked "not in this chunk" → NOT ADDRESSED, so a correct rework
-kept bouncing back to the coder and large reworks parked at the human gate.
-The reasons section now rides in ONE dedicated call that carries the full
-uncapped diff (multi-chunk diffs only; the single-chunk prompt already has
-the whole diff), and a point that only frames the others answers
-'framing — see reasons n-m' with no file:line required.
+chunk was marked "not in this chunk" -> NOT ADDRESSED. Chunking is gone: the
+review is ONE read-only session whose prompt carries the reasons, the capped
+diff and a list of the changed files the cap cut (read from the worktree),
+and a point that only frames the others answers 'framing - see reasons n-m'
+with no file:line required.
 
 Reuses the test_execution harness (spec -> approve -> coder -> human gate
--> reject -> rerun -> code review); the two-chunk shape follows
+-> reject -> rerun -> code review); the capped-diff shape follows
 test_reviewer_diff_cap.py.
 """
 
@@ -35,16 +34,14 @@ REASON_HEAD = "add the cancel flag to cancel.py"
 
 
 class _ChunkedReasonGW(ReasonedRetryGW):
-    """Marker-routed gateway for a two-chunk rework diff.
+    """Marker-routed gateway for a rework diff past the prompt's diff cap.
 
     Round 1's coder writes big.py (~2.4k chars); the post-reject rerun adds
-    cancel.py, the change the human asked for. The rerun's diff therefore
-    splits into two chunks with cancel.py in chunk 2, and the reason is
-    judged by the dedicated whole-diff call (`=== CODE REASONS JUDGEMENT`)
-    — never by a chunk.
+    cancel.py, the change the human asked for. With the cap patched to 2000
+    chars, cancel.py is cut from the prompt's diff and listed as not shown.
 
-    `judgement_replies` is consumed in order by the reasons call; the chunk
-    reviews always approve and never carry Reason lines.
+    `judgement_replies` is consumed in order by the reviews that carry the
+    reasons section.
     """
 
     def __init__(self, judgement_replies: list[str]):
@@ -93,22 +90,17 @@ class _ChunkedReasonGW(ReasonedRetryGW):
                 )
             yield U(prompt_tokens=1, completion_tokens=1)
             return
-        if prompt.startswith("=== CODE REASONS JUDGEMENT ==="):
-            self.calls += 1
-            self.prompts.append(prompt)
-            self.judgements += 1
-            reply = self.judgement_replies.pop(0) if self.judgement_replies else (
-                "Reason 1: ADDRESSED — cancel.py:1"
-            )
-            yield D(text=reply)
-            yield U(prompt_tokens=1, completion_tokens=1)
-            return
         if prompt.startswith("=== CODE REVIEW REQUEST"):
             self.calls += 1
             self.prompts.append(prompt)
-            # a chunk never judges the human's points any more: plain
-            # approving chunk reviews with no Reason lines at all
-            yield D(text="Chunk reviewed: clean.\n\nVERDICT: APPROVED")
+            if "## Human reject reasons to verify" in prompt:
+                self.judgements += 1
+                reply = self.judgement_replies.pop(0) if self.judgement_replies else (
+                    "Reason 1: ADDRESSED — cancel.py:1"
+                )
+                yield D(text=f"{reply}\n\nVERDICT: APPROVED")
+            else:
+                yield D(text="Reviewed: clean.\n\nVERDICT: APPROVED")
             yield U(prompt_tokens=1, completion_tokens=1)
             return
         async for event in super().stream_chat(
@@ -130,14 +122,14 @@ def _reason_notes(client, sid):
     ]
 
 
-def test_reason_fixed_in_later_chunk_is_judged_against_the_whole_diff(
-    tmp_path, monkeypatch
+def test_reason_fixed_in_a_file_the_cap_cuts_is_still_judged_against_the_worktree(
+    tmp_path, monkeypatch, legacy_review
 ):
-    """AC: two-chunk rework diff, the fix lives in chunk 2. The reason is
-    judged ADDRESSED with the chunk-2 file:line by ONE dedicated call whose
-    prompt carries the whole diff (chunk-1 AND chunk-2 content); no chunk
-    prompt carries the reasons section; the story reaches the human gate
-    approved."""
+    """AC: the fix lives in a file the prompt's diff cap cuts. The ONE review
+    prompt carries the reasons section and names the cut file in a list of
+    changed files not shown (the reviewer reads it from the worktree); the
+    reviewer's ADDRESSED answer is accepted and the story reaches the human
+    gate approved."""
     repo = init_repo(tmp_path)
     monkeypatch.setenv("FUBALA_DATABASE_PATH", str(tmp_path / "rwd1.db"))
     monkeypatch.setattr("app.runner.DIFF_CHUNK_SIZE", 2000)
@@ -155,47 +147,26 @@ def test_reason_fixed_in_later_chunk_is_judged_against_the_whole_diff(
         assert final["ai_verdict"] == "approved", final.get("error")
         assert not _reason_notes(client, sid), _reason_notes(client, sid)
 
-        # the rework really was chunked: chunk prompts were sent after the
-        # reject, and cancel.py reached none of them alone
         after = gw.prompts[pre_prompts:]
-        chunk_prompts = [p for p in after if p.startswith("=== CODE REVIEW REQUEST")]
-        assert len(chunk_prompts) >= 2, [p[:80] for p in after]
+        review_prompts = [p for p in after if p.startswith("=== CODE REVIEW REQUEST")]
+        assert len(review_prompts) == 1, [p[:80] for p in after]
+        prompt = review_prompts[0]
+        assert "## Human reject reasons to verify" in prompt
+        assert REASON_HEAD in prompt
+        assert "Points to check, one by one:" in prompt
+        # big.py's diff is shown; cancel.py is cut and listed instead
+        assert BIG_MARKER in prompt
+        assert CANCEL_MARKER not in prompt
+        assert "## Changed files not shown above" in prompt
+        assert "- cancel.py" in prompt
 
-        # exactly ONE prompt carries the reasons section: the dedicated
-        # judgement call, and it carries the WHOLE diff — chunk-1 content
-        # (big.py's marker) AND chunk-2 content (cancel.py)
-        with_reasons = [
-            p for p in after if "## Human reject reasons to verify" in p
-        ]
-        assert len(with_reasons) == 1, [p[:80] for p in with_reasons]
-        judgement = with_reasons[0]
-        assert judgement.startswith("=== CODE REASONS JUDGEMENT ==="), judgement[:120]
-        assert BIG_MARKER in judgement, "chunk-1 content missing from the judgement"
-        assert CANCEL_MARKER in judgement, "chunk-2 content missing from the judgement"
-        assert REASON_HEAD in judgement
-        assert "Points to check, one by one:" in judgement
-
-        # and no chunk prompt judged the reasons: a chunk sees one slice
-        # only, which is exactly the blindness this story removes
-        assert all("## Human reject reasons to verify" not in p for p in chunk_prompts)
-
-        # chunk 1 really does not carry the fix: the whole-diff view is the
-        # only place the reviewer could see it
-        assert CANCEL_MARKER not in chunk_prompts[0]
-
-        # the verdict came from the chunk assembly, the judgement is stored
-        # under its own heading, and its Reason line is what the override
-        # accepted
         assert gw.judgements == 1
-        assert "## Human reject reasons — judged against the whole diff" in (
-            final["ai_review"] or ""
-        )
         assert "Reason 1: ADDRESSED — cancel.py:1" in (final["ai_review"] or "")
         assert "VERDICT: APPROVED" in (final["ai_review"] or "")
 
 
-def test_reason_absent_from_every_chunk_is_not_addressed(tmp_path, monkeypatch):
-    """AC: no chunk carries the change — the whole-diff judgement says NOT
+def test_reason_absent_from_the_diff_is_not_addressed(tmp_path, monkeypatch, legacy_review):
+    """AC: nothing carries the change — the reviewer says NOT
     ADDRESSED, the override rejects the approving verdict, the story is
     requeued and the note names the reason."""
     repo = init_repo(tmp_path)
@@ -319,7 +290,7 @@ def test_framing_answer_needs_no_evidence():
     assert rejection is not None and "Reason 1" in rejection, rejection
 
 
-def test_framing_point_reaches_the_human_gate(tmp_path, monkeypatch):
+def test_framing_point_reaches_the_human_gate(tmp_path, monkeypatch, legacy_review):
     """AC (pipeline): a reviewer who answers the framing point with
     'framing — see reason 2' and the real point with file:line evidence is
     not rejected for the missing citation on the framing point."""

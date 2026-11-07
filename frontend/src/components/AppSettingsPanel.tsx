@@ -319,6 +319,14 @@ export function AppSettingsPanel() {
             hint="wall-clock bound for one headless Claude Code CODE stage"
             onCommit={(v) => patch({ headless_timeout_seconds: v })}
           />
+          <NumberField
+            label="Backend-node fallback"
+            value={settings.worker_fallback_parallel}
+            min={0}
+            max={16}
+            hint="coder runs on the backend node when the dev node is full; 0 = never, stories wait"
+            onCommit={(v) => patch({ worker_fallback_parallel: v })}
+          />
           <QuantityField
             label="Worker CPU request"
             field="worker_cpu_request"

@@ -1768,3 +1768,96 @@ def test_executor_report_unknown_project_404(client):
     assert (
         client.get("/api/v1/projects/does-not-exist/executor-report").status_code == 404
     )
+
+
+# ---- full suite outside the session (FUBALA_RUN_TESTS) -------------------------
+
+
+def test_with_rules_asks_for_the_marker_only_with_a_verify_command():
+    with_verify = hx.with_rules(
+        "=== CODE REQUEST ===", verify_command="make test", test_timeout_seconds=90
+    )
+    assert "Never run the full suite in the session." in with_verify
+    assert "FUBALA_RUN_TESTS" in with_verify
+    assert "`make test`" in with_verify
+    assert "cut at 90 s" in with_verify
+    assert "Run the full verify command before you finish" not in with_verify
+    without = hx.with_rules("=== CODE REQUEST ===")
+    assert "FUBALA_RUN_TESTS" not in without
+    assert "Run the full verify command before you finish." in without
+
+
+def test_test_timeout_reaches_the_child_env_twice_equal():
+    env = hx._child_env(make_config(test_timeout_seconds=2.0))
+    assert env["BASH_DEFAULT_TIMEOUT_MS"] == env["BASH_MAX_TIMEOUT_MS"] == "2000"
+    assert hx.pod_child_env(make_config(), "/work/.claude/1")["BASH_MAX_TIMEOUT_MS"] == "120000"
+
+
+def test_run_tests_outcome_keeps_the_config_dir_and_resume_reuses_it(tmp_path):
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    capture = tmp_path / "capture.txt"
+    bindir = install_fake_claude(
+        tmp_path, "runtests", env={"FAKE_CLAUDE_CAPTURE": str(capture)}
+    )
+    with on_path(bindir):
+        first = hx.run_code_stage(story_id="s9", worktree=wt, prompt="go", config=make_config())
+        assert first.outcome == "run_tests"
+        assert first.session_id == "sess-fake-1"
+        assert first.config_dir and Path(first.config_dir).is_dir()
+        second = hx.run_code_stage(
+            story_id="s9",
+            worktree=wt,
+            prompt="result",
+            config=make_config(),
+            resume_session_id=first.session_id,
+            config_dir=first.config_dir,
+        )
+    assert second.outcome == "ok"
+    assert second.session_id == "sess-fake-1"
+    assert "--resume\nsess-fake-1" in capture.read_text()
+    assert not Path(first.config_dir).exists()
+
+
+def test_marker_without_a_session_id_is_a_fix():
+    stream = hx.StreamReader((), lambda _p: None)
+    stream.feed(json.dumps({"type": "result", "result": "x\nFUBALA_RUN_TESTS", "num_turns": 1}))
+    out = hx.map_outcome(
+        exit_code=0, stderr="", stream=stream, config=make_config(), duration_ms=1,
+        transcript_path=None,
+    )
+    assert out.outcome == "fix"
+
+
+def test_marker_only_counts_as_the_last_line():
+    stream = hx.StreamReader((), lambda _p: None)
+    stream.feed(json.dumps({
+        "type": "result", "session_id": "s", "num_turns": 1,
+        "result": "FUBALA_RUN_TESTS\nbut I changed my mind",
+    }))
+    out = hx.map_outcome(
+        exit_code=0, stderr="", stream=stream, config=make_config(), duration_ms=1,
+        transcript_path=None,
+    )
+    assert out.outcome == "ok"
+
+
+def test_targeted_run_is_cut_and_reported(tmp_path):
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    events: list[dict] = []
+    started = time.monotonic()
+    with on_path(install_fake_claude(tmp_path, "slowtest")):
+        out = hx.run_code_stage(
+            story_id="s10",
+            worktree=wt,
+            prompt="go",
+            config=make_config(test_timeout_seconds=2.0),
+            on_event=events.append,
+        )
+    assert time.monotonic() - started < 25
+    assert out.outcome == "ok"
+    assert out.targeted_cuts == 1
+    assert events.count({"type": "test_cut"}) == 1
+    previews = [e.get("preview", "") for e in events if e.get("type") == "tool_result"]
+    assert "Command timed out after 2000ms" in previews

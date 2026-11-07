@@ -73,6 +73,7 @@ class AppSettingsOut(BaseModel):
     max_external_wip_per_project: int
     api_auth_enabled: bool
     headless_timeout_seconds: float
+    headless_test_timeout_seconds: float
     run_executor: str
     worker_image: str
     worker_fallback_parallel: int
@@ -86,6 +87,9 @@ class AppSettingsOut(BaseModel):
     spec_effort: str
     code_effort: str
     review_effort: str
+    review_max_tool_calls: int
+    review_session_timeout_seconds: int
+    review_test_budget_seconds: int
     # last 4 chars of the API token; None when no token is configured.
     # The full token is returned exactly once, by POST /auth/token.
     api_token_hint: str | None
@@ -150,6 +154,12 @@ class AppSettingsUpdate(BaseModel):
         le=7200,
         description="wall-clock bound for one headless Claude Code child process",
     )
+    headless_test_timeout_seconds: float | None = Field(
+        default=None,
+        ge=10,
+        le=900,
+        description="cut for a targeted test run inside a headless session",
+    )
     run_executor: Literal["in_process", "verify", "pod"] | None = None
     worker_image: str | None = Field(
         default=None,
@@ -158,9 +168,12 @@ class AppSettingsUpdate(BaseModel):
     )
     worker_fallback_parallel: int | None = Field(
         default=None,
-        ge=1,
+        ge=0,
         le=16,
-        description="max coder runs on the backend node at once when no dev node is free",
+        description=(
+            "max coder runs on the backend node at once when no dev node is free; "
+            "0 = never; stories wait for the dev node"
+        ),
     )
     worker_cpu_request: str | None = Field(
         default=None, description="worker pod CPU request, e.g. 1500m", pattern=CPU_PATTERN
@@ -189,6 +202,18 @@ class AppSettingsUpdate(BaseModel):
     )
     review_effort: str | None = Field(
         default=None, description="claude_code --effort; empty = no flag", pattern=EFFORT_PATTERN
+    )
+    review_max_tool_calls: int | None = Field(
+        default=None, ge=5, le=200, description="code review: turn / tool-call cap per session"
+    )
+    review_session_timeout_seconds: int | None = Field(
+        default=None, ge=60, le=3600, description="code review: wall clock per session"
+    )
+    review_test_budget_seconds: int | None = Field(
+        default=None,
+        ge=60,
+        le=3600,
+        description="code review: budget for the changed tests and mutations",
     )
     spec_max_output_tokens: int | None = Field(default=None, ge=256, le=131072)
     coder_max_output_tokens: int | None = Field(default=None, ge=256, le=131072)
@@ -247,6 +272,21 @@ def patch_settings(payload: AppSettingsUpdate, request: Request) -> AppSettingsO
         updates["run_executor"] = DEFAULTS["run_executor"]
     if "worker_fallback_parallel" in updates and updates["worker_fallback_parallel"] is None:
         updates["worker_fallback_parallel"] = DEFAULTS["worker_fallback_parallel"]
+    if "worker_fallback_parallel" in updates or "run_executor" in updates:
+        merged = {**load_settings(request.app.state.engine), **updates}
+        if merged.get("worker_fallback_parallel") == 0 and merged.get("run_executor") != "pod":
+            raise HTTPException(
+                400,
+                "worker_fallback_parallel=0 needs run_executor=pod: otherwise the coder "
+                "always runs in the API process and every story would wait forever",
+            )
+    for key in (
+        "review_max_tool_calls",
+        "review_session_timeout_seconds",
+        "review_test_budget_seconds",
+    ):
+        if key in updates and updates[key] is None:
+            updates[key] = DEFAULTS[key]
     if "worker_image" in updates:
         updates["worker_image"] = (updates["worker_image"] or "").strip()
     for key in (*PHASE_MODEL_KEYS, *PHASE_EFFORT_KEYS):

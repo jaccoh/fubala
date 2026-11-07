@@ -504,7 +504,7 @@ def test_auto_spec_gate_blocked_by_prior_human_rejection(tmp_path, monkeypatch):
 # ---- code gate auto: all green -------------------------------------------
 
 
-def test_auto_code_gate_merge_reaches_done(tmp_path, monkeypatch):
+def test_auto_code_gate_merge_reaches_done(tmp_path, monkeypatch, legacy_review):
     with gate_client(tmp_path, monkeypatch, "code-auto.db") as (client, repo):
         project = make_project(
             client, repo, default_gate_spec="auto", default_gate_code="auto"
@@ -524,7 +524,7 @@ def test_auto_code_gate_merge_reaches_done(tmp_path, monkeypatch):
         assert (Path(repo) / "feature.py").exists()
 
 
-def test_auto_code_gate_push_pr_lands_without_a_human(tmp_path, monkeypatch):
+def test_auto_code_gate_push_pr_lands_without_a_human(tmp_path, monkeypatch, legacy_review):
     """Push+PR delivery: the auto code gate lands through the same branch a
     human approve takes (push + PR) and reaches `landing`, never leaking the
     PR token."""

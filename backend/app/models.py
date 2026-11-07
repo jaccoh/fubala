@@ -300,7 +300,7 @@ class Story(SQLModel, table=True):
         ),
     )
     ai_review: str | None = Field(default=None, description="Latest AI reviewer output (markdown)")
-    ai_verdict: str | None = Field(default=None, description="approved | rejected")
+    ai_verdict: str | None = Field(default=None, description="approved | rejected | incomplete")
     approved_by: str | None = None
     error: str | None = None
     # ---- push+PR delivery (landing) ------------------------------------

@@ -99,6 +99,9 @@ DEFAULTS: dict[str, Any] = {
     # stage of a headless-execution story). Only the headless path reads it;
     # tools_timeout_seconds (the pump's per-tool-call bound) is untouched.
     "headless_timeout_seconds": 2400.0,
+    # cut for a targeted test run the headless CLI starts itself (the full
+    # suite runs outside the session, see headless.RUN_TESTS_MARKER)
+    "headless_test_timeout_seconds": 120.0,
     # worker pods: in_process (default) | verify | pod. verify/pod run every
     # trusted verify/test command in a per-run pod (app/pods.py); pod is
     # identical to verify until the coder itself moves into the pod.
@@ -125,6 +128,11 @@ DEFAULTS: dict[str, Any] = {
     "spec_effort": "high",
     "code_effort": "medium",
     "review_effort": "medium",
+    # code review session: tool-call (turn) cap per session, wall clock per
+    # session, and the budget for phase B (changed tests + mutations)
+    "review_max_tool_calls": 40,
+    "review_session_timeout_seconds": 900,
+    "review_test_budget_seconds": 600,
 }
 
 

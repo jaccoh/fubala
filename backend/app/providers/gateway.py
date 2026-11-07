@@ -32,6 +32,8 @@ class Usage:
     # "tool_calls", ...) — None when the provider never reports one.
     # "length"/"max_tokens" is how an output-cap hit becomes visible.
     finish_reason: str | None = None
+    # a Claude Code session that stopped on its --max-turns cap
+    turn_cap: bool = False
 
 
 @dataclass(frozen=True)

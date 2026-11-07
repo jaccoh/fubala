@@ -110,7 +110,7 @@ def _run_to_gate_and_reject(client, sid, reason):
     return detail, detail["events"][pre_events:]
 
 
-def test_hedged_answer_on_one_point_forces_rejection(tmp_path, monkeypatch):
+def test_hedged_answer_on_one_point_forces_rejection(tmp_path, monkeypatch, legacy_review):
     """AC: the reviewer approves while hedging point 1 ('cannot falsify') and
     answering point 2 with real evidence — the hedge is not a verification,
     so the verdict is overridden to rejected and the note names Reason 1."""
@@ -161,7 +161,7 @@ def test_hedged_answer_on_one_point_forces_rejection(tmp_path, monkeypatch):
         assert detail["ai_verdict"] == "approved"  # the recovering round
 
 
-def test_silent_point_forces_rejection(tmp_path, monkeypatch):
+def test_silent_point_forces_rejection(tmp_path, monkeypatch, legacy_review):
     """AC variant: the reviewer answers point 2 only and stays silent on
     point 1 while approving — the missing line is an unanswered point, so
     the story is rejected with Reason 1 named."""
@@ -218,7 +218,7 @@ def test_operator_note_reaches_the_review_prompt(tmp_path, monkeypatch):
         assert "(from op):" in prompt, prompt
 
 
-def test_every_point_answered_reaches_human_review(tmp_path, monkeypatch):
+def test_every_point_answered_reaches_human_review(tmp_path, monkeypatch, legacy_review):
     """AC: a multi-point rejection answered point by point, each with
     file:line evidence and no hedging, plus an approving verdict, reaches
     the human gate without a rejection round in between."""
@@ -252,8 +252,7 @@ def test_every_point_answered_reaches_human_review(tmp_path, monkeypatch):
 
 
 def test_two_consecutive_rejections_park_instead_of_requeueing(
-    tmp_path, monkeypatch
-):
+    tmp_path, monkeypatch, legacy_review):
     """Loop guard: after CODE_REVIEW_REJECT_LIMIT consecutive AI code-review
     rejections since the human's last touch, the next one parks the story at
     the human gate naming the unanswered point instead of requeueing the

@@ -148,3 +148,65 @@ def parse_sse(text: str) -> list[tuple[str, dict]]:
         if event is not None:
             events.append((event, data or {}))
     return events
+
+
+# ---- the code review's three turns, for tests about what surrounds it --------
+
+
+class _LegacyReviewGateway:
+    """Wraps a test gateway that answers the old single code-review prompt.
+
+    The code review is now three turns (inspect with tools, evidence, verdict).
+    Tests that are about the verdict handling (reasons, loop guard, gates, red
+    verify) keep their single-prompt fakes: the inspect turn is answered here,
+    and the verdict / nudge turns are shown to the wrapped gateway as the old
+    request (system, review prompt, [assistant reply, retry]). Everything else
+    passes straight through."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    async def stream_chat(self, *, messages, tools=None, **kw):
+        last = messages[-1].get("content") if messages else ""
+        if not isinstance(last, str):
+            last = ""
+        if last.startswith("=== CODE REVIEW REQUEST") and tools:
+            yield Delta(text="Inspected the change.")
+            yield Usage(prompt_tokens=1, completion_tokens=1)
+            return
+        if last.startswith("=== REVIEW EVIDENCE"):
+            messages = messages[:2]
+        elif last.startswith("=== CODE REVIEW VERDICT REQUIRED"):
+            messages = [*messages[:2], messages[-2], messages[-1]]
+        async for event in self._inner.stream_chat(messages=messages, tools=tools, **kw):
+            yield event
+
+
+@pytest.fixture
+def legacy_review(monkeypatch):
+    """Collapse the review's evidence phase for tests that are not about it: a
+    wrapped gateway (see above) and a ledger that always holds a green
+    changed-test run and a killed mutation."""
+    from app import review_evidence
+    from app.runner import StoryRunner
+
+    orig_init = StoryRunner.__init__
+
+    def init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        self.gateway = _LegacyReviewGateway(self.gateway)
+
+    async def evidence(self, story_id, ledger, entries, **kw):
+        ledger.mutations_block = True
+        ledger.test_run = review_evidence.TestRun("tests", 0, ["tests/test_x.py"])
+        ledger.mutations = [
+            review_evidence.MutationRun(
+                review_evidence.Mutation("x.py", 1, "a", "b"), "killed", 1
+            )
+        ]
+
+    monkeypatch.setattr(StoryRunner, "__init__", init)
+    monkeypatch.setattr(StoryRunner, "_review_evidence", evidence)

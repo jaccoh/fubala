@@ -1,3 +1,7 @@
+/** The reviewer's verdict. `incomplete` = the code review ran out of budget or
+ * evidence (timeout, turn cap, no test run or mutation): a human decides. */
+export type AiVerdict = "approved" | "rejected" | "incomplete";
+
 export interface SessionInfo {
   id: string;
   title: string;
@@ -149,7 +153,7 @@ export interface Story {
   base_ref: string | null;
   verify_result: VerifyResult | null;
   ai_review: string | null;
-  ai_verdict: string | null;
+  ai_verdict: AiVerdict | null;
   approved_by: string | null;
   error: string | null;
   // push+PR delivery: set when approval opened a pull request (null until
@@ -345,6 +349,8 @@ export interface AppSettings {
   worker_cpu_limit: string;
   worker_memory_request: string;
   worker_memory_limit: string;
+  /** max coder runs on the backend node when the dev node is full; 0 = never */
+  worker_fallback_parallel: number;
   /** last 4 chars of the API token; null when none is configured */
   api_token_hint: string | null;
 }

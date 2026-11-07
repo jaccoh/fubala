@@ -16,7 +16,7 @@ from test_execution import (
 )
 
 
-def test_code_review_override_requeues_and_recovers(tmp_path, monkeypatch):
+def test_code_review_override_requeues_and_recovers(tmp_path, monkeypatch, legacy_review):
     """A code reviewer who approves while explicitly leaving a human reject
     reason NOT ADDRESSED is overridden to rejected and the story requeued;
     the next round addresses it and reaches the human gate."""

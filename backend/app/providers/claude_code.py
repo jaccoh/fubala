@@ -42,6 +42,16 @@ LIMIT_MARKERS = (
 
 RESULT_CAP = 2000
 
+# never available to any CLI session, whatever --tools says: nothing a session
+# may write, run or fetch with (the phases that read get Read, Grep, Glob only)
+DISALLOWED_TOOLS = (
+    "Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "WebFetch", "WebSearch", "Task",
+)
+
+
+class CliTimeout(GatewayError):
+    """The CLI session outlived its wall-clock bound."""
+
 
 def _redact(text: str, token: str) -> str:
     return hx._redact(text, (token,))
@@ -150,6 +160,7 @@ def build_cli_session(
     argv = [
         hx.CLAUDE_BIN, "-p", "--output-format", "json",
         "--model", resolved.model_id, "--tools", cli_tools, "--no-session-persistence",
+        "--disallowedTools", *DISALLOWED_TOOLS,
     ]
     if effort:
         argv += ["--effort", effort]
@@ -165,15 +176,32 @@ def build_cli_session(
     return argv, env, prompt
 
 
+MAX_TURNS_SUBTYPE = "error_max_turns"
+
+
 def parse_cli_result(
-    provider_id: str, key: str, rc: int, stdout: bytes | str, stderr: bytes | str
+    provider_id: str,
+    key: str,
+    rc: int,
+    stdout: bytes | str,
+    stderr: bytes | str,
+    *,
+    allow_turn_cap: bool = False,
 ) -> tuple[str, Usage]:
     """Pure: the finished session's (rc, stdout, stderr) -> (result text,
     usage), or GatewayError (limit markers map to `rate limit`); every string
-    is redacted of the token."""
+    is redacted of the token. A session that hit its --max-turns cap (result
+    subtype `error_max_turns`) reports it as `usage.turn_cap`; with
+    `allow_turn_cap` it is returned (text possibly empty) instead of raised."""
     out = stdout.encode() if isinstance(stdout, str) else stdout
     err = stderr.encode() if isinstance(stderr, str) else stderr
     data = _parse(out)
+    capped = bool(data) and data.get("subtype") == MAX_TURNS_SUBTYPE  # type: ignore[union-attr]
+    if capped and allow_turn_cap:
+        text = data.get("result")  # type: ignore[union-attr]
+        return _redact(text, key) if isinstance(text, str) else "", Usage(
+            prompt_tokens=0, completion_tokens=0, finish_reason="stop", turn_cap=True
+        )
     if data is None or data.get("is_error") or rc != 0:
         text = str((data or {}).get("result") or "")
         if not text:
@@ -195,6 +223,7 @@ def parse_cli_result(
         prompt_tokens=prompt_tokens,
         completion_tokens=int(usage.get("output_tokens") or 0),
         finish_reason="length" if stop in ("max_tokens", "length") else "stop",
+        turn_cap=capped,
     )
 
 
@@ -210,6 +239,7 @@ async def _run_cli(
     timeout: float = CLI_TIMEOUT_SECONDS,
     effort: str | None = None,
     mcp_config: str | None = None,
+    allow_turn_cap: bool = False,
 ) -> tuple[str, Usage]:
     """One local `claude -p` session; returns (result text, usage) or raises
     GatewayError."""
@@ -231,12 +261,12 @@ async def _run_cli(
     except FileNotFoundError as e:
         raise GatewayError(f"[{provider.id}] claude CLI not found: {hx.CLAUDE_BIN}") from e
     except TimeoutError as e:
-        raise GatewayError(
+        raise CliTimeout(
             f"[{provider.id}] claude CLI timed out after {timeout:.0f}s"
         ) from e
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
-    return parse_cli_result(provider.id, key, rc, out, err)
+    return parse_cli_result(provider.id, key, rc, out, err, allow_turn_cap=allow_turn_cap)
 
 
 async def stream_claude_code(
@@ -279,6 +309,7 @@ async def run_cli_agent(
     timeout: float = CLI_TIMEOUT_SECONDS,
     effort: str | None = None,
     mcp_config: str | None = None,
+    allow_turn_cap: bool = False,
 ) -> tuple[str, Usage]:
     """A tool phase (spec) as ONE Claude Code agent session in `cwd` with the
     built-in tools instead of Fubala's tool loop. The final result text is
@@ -286,5 +317,5 @@ async def run_cli_agent(
     return await _run_cli(
         resolved, key, messages, cli_tools=cli_tools, cwd=cwd,
         max_turns=max_turns, max_output_tokens=max_output_tokens, timeout=timeout,
-        effort=effort, mcp_config=mcp_config,
+        effort=effort, mcp_config=mcp_config, allow_turn_cap=allow_turn_cap,
     )

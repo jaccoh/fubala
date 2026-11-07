@@ -247,6 +247,34 @@ def test_graph_mcp_config_travels_in_the_pod_argv(tmp_path, monkeypatch, gateway
         client.__exit__(None, None, None)
 
 
+def test_setting_off_puts_no_graph_in_the_pod_argv(tmp_path, monkeypatch, gateway, no_local_cli):
+    kube = SpecKube()
+    client = pod_client(tmp_path, monkeypatch, gateway, kube)
+    try:
+        client.post("/api/v1/providers/claude-max/key", json={"key": TOKEN})
+        proj = client.post(
+            "/api/v1/projects",
+            json={
+                "name": "demo",
+                "root": _init_repo(tmp_path / "proj"),
+                "code_graph_enabled": False,
+            },
+        ).json()
+        story = client.post(
+            "/api/v1/stories", json={"title": "g", "project_id": proj["id"], "model": MODEL}
+        ).json()
+        client.post(f"/api/v1/stories/{story['id']}/queue")
+        _wait_spec(client, story["id"])
+        _env, argv = parse_frame(kube.frames[0])
+        assert "claude" in argv
+        assert "--mcp-config" not in argv and "--strict-mcp-config" not in argv
+        # no graph-build wrapper around the CLI
+        assert not (argv[:2] == ["sh", "-c"] and "CRG_DATA_DIR" in argv[2])
+        assert not any("code-review-graph" in a for a in argv)
+    finally:
+        client.__exit__(None, None, None)
+
+
 def test_large_prompt_goes_through_a_file(tmp_path):
     kube = SpecKube()
     ex = pods.PodExecutor(

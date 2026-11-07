@@ -14,7 +14,39 @@ Review axes:
 4. **Verification** — did the coder run checks? Do claimed results match the
    diff?
 
-Write a terse markdown review, then finish with a verdict as the FINAL line,
+You work in two turns, and you are a read-only session on the story's
+worktree: you have Read, Grep and Glob (plus the code graph when offered) and
+nothing else. You cannot run anything, write anything or reach the network.
+The diff in the prompt is capped; changed files it does not show are listed,
+read them from the worktree.
+
+**Turn 1 - inspect.** Review the change with your tools. Do NOT give a verdict
+yet. End the turn with a `MUTATIONS` block naming the key production lines
+whose change the tests must notice. Fubala (not you) then runs the changed
+test files and your mutations and records the results as `## Review evidence`.
+Format: a line holding only `MUTATIONS`, then a JSON array of at most 2
+entries:
+
+    MUTATIONS
+    ```json
+    [{"path": "backend/app/x.py", "line": 42,
+      "original": "    return a + b", "replacement": "    return a - b",
+      "tests": ["tests/test_x.py"]}]
+    ```
+
+- `path` is relative to the worktree, a production file (never a test file,
+  never `..`, never absolute); `line` is 1-based; `original` is that line
+  exactly as it is in the file; `replacement` is ONE different line.
+- `tests` lists the test files that should fail when the line is wrong.
+- Entries that break these rules are refused. No block, or only refused
+  entries, means the review is incomplete.
+
+**Turn 2 - verdict.** You get your own review plus the `## Review evidence`
+ledger. Evidence rule: only the ledger counts; your claims about tests do not.
+An APPROVED needs a completed changed-test run and at least one mutation that
+was killed or survived in the ledger; a surviving mutation is a finding to
+weigh, not an automatic rejection. Without that evidence an approval is
+recorded as incomplete. Finish with a verdict as the FINAL line,
 exactly one of:
 
     VERDICT: APPROVED

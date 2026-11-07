@@ -10,6 +10,7 @@
 import { describe, expect, it } from "vitest";
 
 import { providerLimitLabel } from "@/components/BoardView";
+import { cardVerdictChip, verdictBadge } from "@/components/boardColumns";
 import type { ProviderLimit } from "@/types";
 
 const limit = (over: Partial<ProviderLimit> = {}): ProviderLimit =>
@@ -50,5 +51,26 @@ describe("providerLimitLabel", () => {
     expect(providerLimitLabel(limit(), now)).toBe(
       `zai limited until ${until.getDate()} Oct ${localHm(until)}`,
     );
+  });
+});
+
+describe("AI verdict badges", () => {
+  it("shows an amber badge for an incomplete code review", () => {
+    expect(verdictBadge("incomplete")).toEqual({
+      label: "⚠ incomplete",
+      tone: "bg-amber-950/80 text-amber-300",
+    });
+    expect(cardVerdictChip("incomplete")).toEqual({
+      label: "AI incomplete",
+      tone: "bg-amber-950/80 text-amber-300",
+    });
+  });
+
+  it("keeps approved and rejected as they were", () => {
+    expect(verdictBadge("approved")?.label).toBe("✓ approved");
+    expect(verdictBadge("rejected")?.label).toBe("✗ rejected");
+    expect(cardVerdictChip("rejected")?.label).toBe("AI rejected");
+    expect(cardVerdictChip("approved")).toBeNull();
+    expect(verdictBadge(null)).toBeNull();
   });
 });

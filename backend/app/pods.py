@@ -503,6 +503,20 @@ _EXEC_OUTER = (
     '/work/.exec/{n}.pgid "$cmd"'
 )
 
+# One mutation run. argv: $1 = cwd, $2 = repo-relative file, $3 = command,
+# $4 = timeout seconds, $5 = exec number; stdin = the mutated file. The file is
+# written from stdin, the command runs under `timeout` like _EXEC_OUTER, and the
+# trap restores the file from the snapshot checkout whatever happens.
+_MUTATE_SCRIPT = (
+    'cd "$1" || exit 125; f=$2; cmd=$3; t=$4; n=$5; '
+    'mkdir -p "$HOME" /work/.exec; touch ' + HEARTBEAT + "; "
+    "trap 'git checkout -q -- \"$f\" 2>/dev/null' EXIT; trap 'exit 143' INT TERM HUP; "
+    'cat > "$f" || exit 125; '
+    "setsid --wait sh -c "
+    '\'echo $$ > "$0"; exec timeout --kill-after=10 "$1" sh -c "$2" </dev/null\' '
+    '"/work/.exec/$n.pgid" "$t" "$cmd"'
+)
+
 # stdin: "<N>\n" then N bytes of git bundle; $1 = snapshot ref, $2 = sha,
 # $3 (optional, headless) = the snapshot's parent: `reset -q` to it so the
 # pod's HEAD equals the local HEAD and uncommitted work stays uncommitted
@@ -686,6 +700,19 @@ _FALLBACK_LOCK = threading.Lock()
 _FALLBACK_HELD: set[str] = set()
 
 
+def fallback_cap(settings: dict) -> int:
+    """worker_fallback_parallel; missing or None gives the default, 0 stays 0."""
+    value = settings.get("worker_fallback_parallel")
+    if value is None:
+        return int(DEFAULTS["worker_fallback_parallel"])
+    return int(value)
+
+
+def local_fallback_disabled(settings: dict) -> bool:
+    """In-cluster with a fallback cap of 0: nothing may run on the backend node."""
+    return bool(backend_node()) and fallback_cap(settings) == 0
+
+
 def try_claim_fallback(story_id: str, cap: int, kube: KubeApi | None) -> bool:
     """Claim one of `cap` slots on the backend node for this story. The count
     is the union by story id of live managed pods placed on the backend node
@@ -846,7 +873,7 @@ class PodExecutor:
             phase = state.get("phase")
             node = state.get("node") or ""
             if node and node == backend_node() and not self._claimed:
-                cap = int(self.settings.get("worker_fallback_parallel") or 2)
+                cap = fallback_cap(self.settings)
                 if not try_claim_fallback(self.story_id, cap, kube):
                     self._delete_pod()
                     raise FallbackCapFull(f"fallback cap {cap} reached on {node}")
@@ -1119,8 +1146,14 @@ class PodExecutor:
         project_root: str,
         commit_message: str,
         on_artefacts: Callable[[list[str]], None] | None = None,
+        resume: tuple[str, str] | None = None,
     ) -> headless.HeadlessOutcome:
         """One headless CODE round in the pod.
+
+        `resume` = (session id, config dir) of a previous segment that ended
+        with a run_tests outcome: the CLI is resumed (`--resume`) in the same
+        in-pod config dir. A run_tests outcome carries that dir in
+        `config_dir`.
 
         PodUnavailable before the exec starts (the caller then runs the round
         locally); PodRunLost after it started. On success the round is
@@ -1137,9 +1170,11 @@ class PodExecutor:
             # ---- started: from here on no fallback, only PodRunLost
             self._exec_n += 1
             n = self._exec_n
-            config_dir = f"{CLAUDE_DIR}/{n}"
+            config_dir = resume[1] if resume else f"{CLAUDE_DIR}/{n}"
             env = headless.pod_child_env(config, config_dir)
-            child_argv = headless.child_argv(prompt, config)
+            child_argv = headless.child_argv(
+                prompt, config, resume[0] if resume else None
+            )
             if config.mcp_config:
                 # the graph is built inside the pod (data under /tmp, never in
                 # the repo) right before the CLI starts; fail open
@@ -1190,6 +1225,8 @@ class PodExecutor:
             )
             if timed_out:
                 self._delete_pod()  # a later round gets a fresh pod
+            if outcome.outcome == "run_tests":
+                outcome.config_dir = config_dir
             return outcome
 
     def _spill(self, path: str, data: bytes) -> None:
@@ -1277,6 +1314,40 @@ class PodExecutor:
             if rc == 124:
                 self._delete_pod()  # a later session gets a fresh pod
         return rc, headless._redact(out, literals), headless._redact(err, literals)
+
+    def run_mutation(
+        self, rel_path: str, mutated_bytes: bytes, command: str, timeout: float
+    ) -> tuple[int, str]:
+        """One mutation run in the pod: write `mutated_bytes` over `rel_path`
+        (from stdin), run `command`, and restore the file with `git checkout
+        --` in a trap, all in ONE exec. Returns (rc, output tail); rc 124 when
+        the timeout expired. The pod must hold the synced snapshot (a
+        `run_cli_session` or `sync_workspace` call before). PodUnavailable
+        before the exec starts; nothing ever runs locally."""
+        with self._lock:
+            self.prepare()
+            self._exec_n += 1
+            n = self._exec_n
+            argv = [
+                "sh", "-c", _MUTATE_SCRIPT, "_",
+                REPO_DIR, rel_path, add_maxprocesses(command),
+                str(max(1, int(math.ceil(timeout)))), str(n),
+            ]  # fmt: skip
+            self._in_exec = True
+            try:
+                rc, out, err = self._exec(argv, mutated_bytes, timeout + EXEC_MARGIN)
+            except ExecTimeout:
+                warn_once("exec-timeout", "a mutation exec outlived its bound; pod deleted")
+                self._reap("timeout")
+                self._delete_pod()  # a later call gets a fresh pod and a fresh sync
+                return 124, f"mutation run timed out after {timeout}s"
+            finally:
+                self._in_exec = False
+            self._reap("timeout" if rc == 124 else "round_end")
+        output = out[-MAX_OUTPUT:]
+        if err.strip():
+            output += f"\nstderr:\n{err[-MAX_OUTPUT:]}"
+        return rc, output
 
     def kill(self) -> None:
         """Graceful in-pod kill of running execs (TERM, KILL after 10s)."""
@@ -1410,6 +1481,8 @@ def heartbeat_all() -> None:
 
 __all__ = [
     "FallbackCapFull",
+    "fallback_cap",
+    "local_fallback_disabled",
     "PodExecutor",
     "PodRunLost",
     "PodUnavailable",

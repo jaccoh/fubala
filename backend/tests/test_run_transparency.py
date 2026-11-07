@@ -94,7 +94,7 @@ class ActivityGateway:
         yield U(prompt_tokens=5, completion_tokens=5)
 
 
-def test_coder_run_persists_round_tool_events_in_order(tmp_path, monkeypatch):
+def test_coder_run_persists_round_tool_events_in_order(tmp_path, monkeypatch, legacy_review):
     repo = init_repo(tmp_path)
     monkeypatch.setenv("FUBALA_DATABASE_PATH", str(tmp_path / "activity.db"))
 
@@ -133,7 +133,8 @@ def test_coder_run_persists_round_tool_events_in_order(tmp_path, monkeypatch):
         assert len(calls[0]["args"]) <= 80
 
         # Round events carry the budget snapshot, rounds monotonic.
-        rounds = [d for k, d in acts if k == "round"]
+        # (the code review's own session reports rounds too, as phase code_review)
+        rounds = [d for k, d in acts if k == "round" and d.get("phase") != "code_review"]
         nums = [r["round"] for r in rounds]
         assert nums == sorted(nums), nums
         assert nums[-1] >= 3

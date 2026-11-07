@@ -3,7 +3,8 @@ import { BudgetMeters } from "@/components/BudgetMeters";
 import { RunningToolBadge } from "@/components/RunningTool";
 import { DiffViewer } from "@/components/DiffViewer";
 import { Markdown } from "@/components/MessageItem";
-import { BADGE, FIELD_LABEL, PANEL, badgeTone } from "@/components/ui";
+import { verdictBadge } from "@/components/boardColumns";
+import { BADGE, FIELD_LABEL, PANEL } from "@/components/ui";
 import { OUTCOME_STATUSES, OutcomeSection } from "@/components/story/OutcomeSection";
 import { StoryForm } from "@/components/story/StoryForm";
 import { StoryHistory, StoryNotes } from "@/components/story/StoryTimeline";
@@ -63,6 +64,7 @@ export function StoryBody({
     detail !== null &&
     !detail.code_diff &&
     !(detail.evidence?.code_diff || detail.evidence?.summary || detail.evidence?.verify);
+  const aiBadge = verdictBadge(live.ai_verdict);
   const showActivity = LIVE_LOG_STATUSES.includes(live.status);
   const running = live.status === "in_progress" || live.status === "executing";
 
@@ -156,10 +158,8 @@ export function StoryBody({
         <section>
           <div className="mb-2 flex items-center justify-between">
             <h3 className={FIELD_LABEL}>AI review</h3>
-            {live.ai_verdict && (
-              <span className={`${BADGE} ${badgeTone(live.ai_verdict === "approved")}`}>
-                {live.ai_verdict === "approved" ? "✓ approved" : "✗ rejected"}
-              </span>
+            {aiBadge && (
+              <span className={`${BADGE} ${aiBadge.tone}`}>{aiBadge.label}</span>
             )}
           </div>
           <div className={PANEL}>

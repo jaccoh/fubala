@@ -54,7 +54,9 @@ def _coder_prompts(gw: RecordingGW) -> list[str]:
     return out
 
 
-def test_the_rework_prompt_carries_the_code_reviewers_rejection(tmp_path, monkeypatch):
+def test_the_rework_prompt_carries_the_code_reviewers_rejection(
+    tmp_path, monkeypatch, legacy_review
+):
     from app.providers import Delta as D
 
     moves = [
@@ -80,7 +82,9 @@ def test_the_rework_prompt_carries_the_code_reviewers_rejection(tmp_path, monkey
         client.__exit__(None, None, None)
 
 
-def test_the_rework_prompt_carries_the_humans_code_gate_reasons(tmp_path, monkeypatch):
+def test_the_rework_prompt_carries_the_humans_code_gate_reasons(
+    tmp_path, monkeypatch, legacy_review
+):
     """After a human rejects at the code gate, the next coder round sees the
     human's reason verbatim -- also when the AI review rejected again in
     between (its one-line reason must not hide the human's numbered list)."""

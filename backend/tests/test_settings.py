@@ -238,3 +238,16 @@ def test_slot_settings_bounds_and_the_deprecated_alias(client):
     assert body["model_slots"] == 3
     body = client.patch("/api/v1/settings", json={"model_slots": None, "test_slots": None}).json()
     assert body["model_slots"] == 2 and body["test_slots"] == 2
+
+
+def test_worker_fallback_parallel_zero_needs_pod_executor(client):
+    assert client.patch("/api/v1/settings", json={"worker_fallback_parallel": 0}).status_code == 400
+    r = client.patch(
+        "/api/v1/settings", json={"run_executor": "pod", "worker_fallback_parallel": 0}
+    )
+    assert r.status_code == 200
+    assert client.get("/api/v1/settings").json()["worker_fallback_parallel"] == 0
+    assert client.patch("/api/v1/settings", json={"run_executor": "verify"}).status_code == 400
+    r = client.patch("/api/v1/settings", json={"worker_fallback_parallel": None})
+    assert r.status_code == 200
+    assert client.get("/api/v1/settings").json()["worker_fallback_parallel"] == 2

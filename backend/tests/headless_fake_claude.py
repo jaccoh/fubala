@@ -29,6 +29,14 @@ wrapper (never an ambient env var, so parallel tests cannot cross-talk):
               "=== MERGE CONFLICT RESOLUTION REQUEST ===": resolve rewrites
               each listed file without markers and `git add`s it, markers
               leaves the file untouched, crash exits 3.
+  runtests    the first call emits an init event with a session_id, writes
+              feature.py and a session JSONL, and ends with FUBALA_RUN_TESTS.
+              A call with --resume appends its argv to $FAKE_CLAUDE_CAPTURE,
+              checks the session JSONL still exists in $CLAUDE_CONFIG_DIR,
+              and finishes with the same session_id and "done".
+  slowtest    runs `sleep 30` with $BASH_MAX_TIMEOUT_MS as its timeout, then
+              emits an error tool_result "Command timed out after <ms>ms" and
+              an ok result.
   fix_ok / fix_crash
               behave like ok, except for a prompt starting with
               "=== FIX REQUEST ===" (the verify fix round): fix_ok writes
@@ -121,6 +129,52 @@ if MODE == "capture":
         except OSError:
             pass
     emit(result_event(result="captured", num_turns=1, usage={}))
+    sys.exit(0)
+
+SESSION_ID = "sess-fake-1"
+
+if MODE == "runtests":
+    if "--resume" in argv:
+        target = os.environ.get("FAKE_CLAUDE_CAPTURE", "")
+        if target:
+            with open(target, "a") as fh:
+                fh.write("\n".join(argv) + "\n--- end call ---\n")
+        cfg = os.environ.get("CLAUDE_CONFIG_DIR", "")
+        kept = os.path.join(cfg, "projects", "demo-repo", "session-abc.jsonl")
+        if not os.path.exists(kept):
+            sys.stderr.write("No conversation found with session ID\n")
+            sys.exit(1)
+        resumed = argv[argv.index("--resume") + 1]
+        emit({"type": "system", "subtype": "init", "session_id": resumed})
+        emit(result_event(result="done", session_id=resumed, num_turns=2))
+        sys.exit(0)
+    with open("feature.py", "w") as fh:
+        fh.write("VALUE = 'headless'\n")
+    emit({"type": "system", "subtype": "init", "session_id": SESSION_ID})
+    write_transcript()
+    emit(result_event(
+        result="Wrote feature.py.\n\nFUBALA_RUN_TESTS\n",
+        session_id=SESSION_ID,
+        num_turns=2,
+    ))
+    sys.exit(0)
+
+if MODE == "slowtest":
+    import subprocess
+
+    limit_ms = int(os.environ.get("BASH_MAX_TIMEOUT_MS", "120000"))
+    emit({"type": "system", "subtype": "init", "session_id": SESSION_ID})
+    emit({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": "Bash", "input": {"command": "sleep 30"}}]}})
+    try:
+        subprocess.run(["sleep", "30"], timeout=limit_ms / 1000.0)
+    except subprocess.TimeoutExpired:
+        pass
+    emit({"type": "user", "message": {"content": [
+        {"type": "tool_result", "is_error": True,
+         "content": f"Command timed out after {limit_ms}ms"}]}})
+    emit(result_event(session_id=SESSION_ID))
+    write_transcript()
     sys.exit(0)
 
 if MODE == "crash":

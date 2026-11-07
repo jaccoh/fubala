@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -14,7 +15,17 @@ import pytest
 from conftest import MINIMAL_SPEC
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
-from test_headless import install_fake_claude, make_config, on_path
+from test_claude_code_phases import MODEL, TOKEN, _spec_spawn
+from test_headless import (
+    FAKE_SCRIPT,
+    _events,
+    _headless_client,
+    _init_repo,
+    _wait_for_status,
+    install_fake_claude,
+    make_config,
+    on_path,
+)
 
 from app import code_graph, workspaces
 from app import headless as hx
@@ -70,7 +81,7 @@ def data_dir(tmp_path, monkeypatch) -> Path:
 def test_graph_stays_out_of_the_tree(tmp_path, data_dir):
     repo = _fixture_repo(tmp_path)
     wt, base, _ = workspaces.create(str(repo), "s1")
-    out = code_graph.build(wt, code_graph.graph_dir("s1"), "p1")
+    out = code_graph.build(wt, code_graph.graph_dir("s1"))
     assert out is not None and (out / "graph.db").is_file()
     assert data_dir in out.parents
     (wt / "lib.py").write_text(LIB.replace("x + 1", "x + 2"))
@@ -79,8 +90,8 @@ def test_graph_stays_out_of_the_tree(tmp_path, data_dir):
     diff = workspaces.diff(str(repo), "s1", base, max_chars=None)
     assert "code-review-graph" not in diff and "graph.db" not in diff
     assert not (wt / ".code-review-graph").exists()
-    # the project's base graph is saved for the next story
-    assert (code_graph.base_dir("p1") / "graph.db").is_file()
+    # no shared base graph: only the story's own dir exists
+    assert [p.name for p in (data_dir / "code-graph").iterdir()] == ["s1"]
 
 
 def test_impact_report_flags_only_the_uncovered_caller(tmp_path, data_dir):
@@ -88,7 +99,7 @@ def test_impact_report_flags_only_the_uncovered_caller(tmp_path, data_dir):
     wt, base, _ = workspaces.create(str(repo), "s2")
     (wt / "lib.py").write_text(LIB.replace("x + 1", "x + 2"))
     _git(wt, "commit", "-qam", "coder")
-    out = code_graph.build(wt, code_graph.graph_dir("s2"), "p1")
+    out = code_graph.build(wt, code_graph.graph_dir("s2"))
     assert out is not None
     report = code_graph.impact_report(wt, base, out)
     assert report is not None
@@ -119,10 +130,10 @@ def test_no_argv_carries_an_embedding_flag(tmp_path, data_dir, monkeypatch):
     wt = tmp_path / "wt"
     wt.mkdir()
     out = tmp_path / "out"
-    code_graph.build(wt, out, "p")  # build
+    code_graph.build(wt, out)  # build
     out.mkdir(parents=True, exist_ok=True)
     (out / "graph.db").write_text("x")
-    code_graph.build(wt, out, "p")  # update
+    code_graph.build(wt, out)  # update
     code_graph.impact_report(wt, "HEAD~1", out)  # update, detect-changes, impact
     assert any("build" in c for c in seen) and any("update" in c for c in seen)
     argvs = [*seen, code_graph.argv("mcp", "--repo", str(wt))]
@@ -145,7 +156,7 @@ def test_failures_fail_open(tmp_path, data_dir, monkeypatch):
     monkeypatch.setattr(subprocess, "run", boom)
     wt = tmp_path / "wt"
     wt.mkdir()
-    assert code_graph.build(wt, tmp_path / "out", "p") is None
+    assert code_graph.build(wt, tmp_path / "out") is None
     assert code_graph.impact_report(wt, "HEAD", tmp_path / "out") is None
 
 
@@ -315,3 +326,189 @@ def test_code_review_prompt_carries_the_impact_report(tmp_path, data_dir, monkey
     assert review_prompts and "## Impact report" in review_prompts[-1]
     assert "uncovered_caller" in review_prompts[-1]
     assert not (code_graph.graph_dir(story["id"])).exists()
+
+
+def test_build_leaves_only_the_storys_own_dir(tmp_path, data_dir, monkeypatch):
+    def fake_exec(cmd, *, cwd, env, timeout):
+        Path(env["CRG_DATA_DIR"], "graph.db").write_text("x")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(code_graph, "_exec", fake_exec)
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    out = code_graph.build(wt, code_graph.graph_dir("s9"))
+    assert out == code_graph.graph_dir("s9")
+    assert [p.name for p in (data_dir / "code-graph").iterdir()] == ["s9"]
+
+
+# ---- the setting off: no MCP config, no impact report -------------------------
+
+
+def _capturing_coder(tmp_path: Path) -> tuple[Path, Path]:
+    """A `claude` that records its argv, then behaves like the fake's "ok" mode
+    (the bare capture mode makes no change, so the story never reaches review)."""
+    capture = tmp_path / "coder-argv.txt"
+    bindir = tmp_path / "bin-capturing"
+    bindir.mkdir()
+    script = bindir / "claude"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, runpy, sys\n"
+        f"open({str(capture)!r}, 'w').write('\\n'.join(sys.argv[1:]))\n"
+        "sys.argv[0] = 'claude'\n"
+        "os.environ['FAKE_CLAUDE_MODE'] = 'ok'\n"
+        f"runpy.run_path({str(FAKE_SCRIPT)!r}, run_name='__main__')\n"
+    )
+    script.chmod(0o755)
+    return bindir, capture
+
+
+def _max_flow(tmp_path, monkeypatch, gateway, *, graph: bool):
+    """A claude-max story to the code gate. Returns (spec argv, coder argv,
+    impact notes, build calls, impact_report calls)."""
+    spec_calls = _spec_spawn(monkeypatch)
+    builds: list[tuple] = []
+    reports: list[tuple] = []
+
+    def fake_build(worktree, out_dir):
+        builds.append((worktree, out_dir))
+        return out_dir if graph else None
+
+    def fake_report(worktree, base, out_dir):
+        reports.append((worktree, base, out_dir))
+        return "REPORT-MARKER"
+
+    monkeypatch.setattr(code_graph, "build", fake_build)
+    monkeypatch.setattr(code_graph, "impact_report", fake_report)
+    bindir, capture = _capturing_coder(tmp_path)
+    client = _headless_client(tmp_path, monkeypatch, gateway, "ok")
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    try:
+        client.post("/api/v1/providers/claude-max/key", json={"key": TOKEN})
+        proj = client.post(
+            "/api/v1/projects",
+            json={
+                "name": "demo", "root": _init_repo(tmp_path / "proj"),
+                "code_graph_enabled": graph,
+            },
+        ).json()
+        story = client.post(
+            "/api/v1/stories",
+            json={
+                "title": "max", "project_id": proj["id"], "model": MODEL,
+                "execution": "internal",
+            },
+        ).json()
+        client.post(f"/api/v1/stories/{story['id']}/queue")
+        _wait_for_status(client, story["id"], "human_review", 60)  # spec gate
+        client.post(f"/api/v1/stories/{story['id']}/approve", json={"by": "t"})
+        _wait_for_status(client, story["id"], "human_review", 120)  # code gate
+        notes = [e["data"] for e in _events(client, story["id"], "note")]
+    finally:
+        client.__exit__(None, None, None)
+    impact = [n for n in notes if n.get("impact_report")]
+    return spec_calls[0]["argv"], capture.read_text().split("\n"), impact, builds, reports
+
+
+def test_setting_off_gives_the_cli_sessions_no_mcp_and_no_impact_report(
+    tmp_path, monkeypatch, gateway
+):
+    spec, coder, impact, builds, reports = _max_flow(tmp_path, monkeypatch, gateway, graph=False)
+    assert "--mcp-config" not in spec and "--mcp-config" not in coder
+    assert builds == [] and reports == []
+    assert impact == []
+
+
+def test_setting_on_is_the_positive_control(tmp_path, monkeypatch, gateway):
+    spec, coder, impact, builds, reports = _max_flow(tmp_path, monkeypatch, gateway, graph=True)
+    assert "--mcp-config" in spec and "--mcp-config" in coder
+    assert builds and len(reports) == 1
+    assert len(impact) == 1 and impact[0]["content"] == "REPORT-MARKER"
+
+
+# ---- the impact section in every code-review prompt path ----------------------
+
+IMPACT_MARKER = "IMPACT-MARKER-7C41"
+
+
+class _PromptGateway:
+    """Pump pipeline gateway routed by prompt prefix; records code-review prompts."""
+
+    def __init__(self, content: str):
+        self.content = content
+        self.review_prompts: list[str] = []
+        self.coded = False
+
+    async def stream_chat(self, *, model, messages, tools=None, max_output_tokens=None, **kw):
+        from app.providers import Delta as D
+        from app.providers import ToolCall as TC
+        from app.providers import Usage as U
+
+        last = messages[-1].get("content") or ""
+        if not isinstance(last, str):
+            last = ""
+        if last.startswith("=== SPEC REQUEST"):
+            yield D(text=MINIMAL_SPEC)
+        elif last.startswith("=== CODE REVIEW REQUEST"):
+            self.review_prompts.append(last)
+            yield D(text="fine\n\nVERDICT: APPROVED")
+        elif last.startswith("=== CODE REQUEST") or messages[-1]["role"] == "tool":
+            if self.coded:
+                yield D(text="done")
+            else:
+                self.coded = True
+                yield TC(
+                    id="w1", name="write_file",
+                    arguments=json.dumps({"path": "big.py", "content": self.content}),
+                )
+        else:
+            yield D(text="ok\n\nVERDICT: APPROVED")
+        yield U(prompt_tokens=1, completion_tokens=1)
+
+
+def _review_prompts(tmp_path, monkeypatch, content: str) -> list[str]:
+    repo = _fixture_repo(tmp_path)
+    monkeypatch.setenv("FUBALA_DATABASE_PATH", str(tmp_path / "chunk.db"))
+    monkeypatch.setattr("app.runner.DIFF_CHUNK_SIZE", 2000)
+    monkeypatch.setattr(code_graph, "build", lambda wt, out: out)
+    monkeypatch.setattr(code_graph, "impact_report", lambda wt, base, out: IMPACT_MARKER)
+    gw = _PromptGateway(content)
+    with TestClient(create_app(gateway=gw)) as client:
+        client.patch(
+            "/api/v1/settings",
+            json={
+                "story_poll_interval": 0.05, "project_root": str(repo),
+                "write_tools_enabled": True, "max_tool_calls": 8,
+            },
+        )
+        project = client.post(
+            "/api/v1/projects",
+            json={"name": "p", "root": str(repo), "code_graph_enabled": True},
+        ).json()
+        story = client.post(
+            "/api/v1/stories", json={"title": "graph", "project_id": project["id"]}
+        ).json()
+        client.post(f"/api/v1/stories/{story['id']}/queue")
+        _wait_for_status(client, story["id"], "human_review", 60)  # spec gate
+        client.post(f"/api/v1/stories/{story['id']}/approve", json={"by": "t"})
+        _wait_for_status(client, story["id"], "human_review", 120)  # code gate
+    return gw.review_prompts
+
+
+def _has_impact(prompt: str) -> bool:
+    head, _, rest = prompt.partition("## Impact report")
+    return bool(rest) and IMPACT_MARKER in rest.split("\n## ", 1)[0]
+
+
+def test_impact_section_is_in_the_capped_large_diff_prompt(tmp_path, monkeypatch):
+    # chunking is gone: a large diff is capped in one prompt, impact included
+    prompts = _review_prompts(tmp_path, monkeypatch, "VALUE = 1\n" * 700)
+    assert len(prompts) == 1
+    assert prompts[0].startswith("=== CODE REVIEW REQUEST ===")
+    assert _has_impact(prompts[0]), prompts[0][:300]
+
+
+def test_impact_section_is_in_the_single_prompt(tmp_path, monkeypatch):
+    prompts = _review_prompts(tmp_path, monkeypatch, "VALUE = 1\n")
+    assert len(prompts) == 1 and "Chunk" not in prompts[0].splitlines()[0]
+    assert _has_impact(prompts[0])

@@ -19,7 +19,7 @@ from pathlib import Path
 
 from sqlmodel import Session, select
 
-from . import procs
+from . import pods, procs
 from .guardrails import path_denied
 from .models import Story, StoryKind
 
@@ -809,6 +809,8 @@ class ToolBox:
                 self.story_id,
                 **self._executor_kwargs(),
             )
+        except pods.FallbackCapFull:
+            return {"error": "no worker pod could be had and local runs are disabled; retry later"}
         finally:
             if self.watchdog_floor is not None:
                 self.watchdog_floor(None)
@@ -886,6 +888,8 @@ class ToolBox:
                 self.story_id,
                 **self._executor_kwargs(),
             )
+        except pods.FallbackCapFull:
+            return {"error": "no worker pod could be had and local runs are disabled; retry later"}
         finally:
             if self.watchdog_floor is not None:
                 self.watchdog_floor(None)

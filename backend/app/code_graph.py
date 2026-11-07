@@ -27,9 +27,10 @@ pin lives in `[tool.fubala]` in pyproject.toml and `PIN` below, and
 tests/test_worker_image_parity.py keeps all of them equal. Without the binary on
 PATH, `_cli()` falls back to `uvx --from code-review-graph==PIN`.
 
-Base graph: a graph records absolute file paths and `update` refuses a graph
-built under another root. A base copied from another worktree therefore fails
-the incremental update, and `build()` falls back to a full build in that case.
+No shared base graph: a graph records absolute file paths and `update` refuses
+a graph built under another root, and every story has its own worktree root. So
+`build()` updates the story's own graph if it exists (a retry in the same
+worktree) and otherwise does a full build.
 
 Every function times out and fails open: on failure it logs and returns None
 and never fails a run.
@@ -70,10 +71,6 @@ UNAVAILABLE = "impact report unavailable"
 
 def graph_dir(story_id: str) -> Path:
     return data_root() / "code-graph" / story_id
-
-
-def base_dir(project_id: str | None) -> Path:
-    return data_root() / "code-graph" / "_base" / (project_id or "_default")
 
 
 def data_root() -> Path:
@@ -139,27 +136,18 @@ def _run(
     return done
 
 
-def build(worktree: Path, out_dir: Path, project_id: str | None) -> Path | None:
+def build(worktree: Path, out_dir: Path) -> Path | None:
     """A graph for `worktree` in `out_dir` (outside the tree); out_dir or None."""
     try:
         worktree, out_dir = Path(worktree), Path(out_dir)
-        base = base_dir(project_id)
-        if not (out_dir / "graph.db").is_file():
-            if (base / "graph.db").is_file():
-                shutil.copytree(base, out_dir, dirs_exist_ok=True)
         if (out_dir / "graph.db").is_file():
             if _run(worktree, out_dir, "update", timeout=BUILD_TIMEOUT) is not None:
                 return out_dir
-            # e.g. the base graph was built under another root: start over
+            # e.g. built under another root: start over
             shutil.rmtree(out_dir, ignore_errors=True)
-            if _run(worktree, out_dir, "build", timeout=BUILD_TIMEOUT) is None:
-                return None
-            return out_dir
         if _run(worktree, out_dir, "build", timeout=BUILD_TIMEOUT) is None:
             shutil.rmtree(out_dir, ignore_errors=True)
             return None
-        if not (base / "graph.db").is_file():
-            shutil.copytree(out_dir, base, dirs_exist_ok=True)
         return out_dir
     except Exception:  # noqa: BLE001 - fail open
         log.warning("code graph build failed", exc_info=True)
@@ -167,7 +155,7 @@ def build(worktree: Path, out_dir: Path, project_id: str | None) -> Path | None:
 
 
 def cleanup(*story_ids: str) -> None:
-    """Drop the per-story graph dirs (the project's base graph stays)."""
+    """Drop the per-story graph dirs."""
     for sid in story_ids:
         shutil.rmtree(graph_dir(sid), ignore_errors=True)
 

@@ -5,7 +5,13 @@ import { NewStoryModal } from "@/components/NewStoryModal";
 import { ProjectPicker } from "@/components/ProjectPicker";
 import { StoryDetail } from "@/components/StoryDetail";
 import { TrainPanel } from "@/components/TrainPanel";
-import { COLUMNS, belongsToColumn, columnForStatus, isCollapsedLane } from "@/components/boardColumns";
+import {
+  COLUMNS,
+  belongsToColumn,
+  cardVerdictChip,
+  columnForStatus,
+  isCollapsedLane,
+} from "@/components/boardColumns";
 import { useStore } from "@/store";
 import type { ProviderLimit, Story } from "@/types";
 
@@ -65,6 +71,7 @@ function StoryCard({ story, blockedBy }: { story: Story; blockedBy: Story[] }) {
   const projects = useStore((s) => s.projects);
   const progress = useStore((s) => s.storyProgress[story.id]);
   const column = columnForStatus(story.status);
+  const verdictChip = cardVerdictChip(story.ai_verdict);
   const epic = epics.find((e) => e.id === story.epic_id);
   const project = projects.find((p) => p.id === story.project_id);
   const busy =
@@ -123,9 +130,16 @@ function StoryCard({ story, blockedBy }: { story: Story; blockedBy: Story[] }) {
           </span>
         )}
         <SlotChip slotState={story.slot_state} />
-        {story.ai_verdict === "rejected" && (
-          <span className="shrink-0 rounded bg-red-950/80 px-1 text-[10px] text-red-300">
-            AI rejected
+        {verdictChip && (
+          <span
+            className={`shrink-0 rounded px-1 text-[10px] ${verdictChip.tone}`}
+            title={
+              story.ai_verdict === "incomplete"
+                ? "the AI code review could not finish with evidence — a human decides"
+                : undefined
+            }
+          >
+            {verdictChip.label}
           </span>
         )}
         <span className="ml-auto shrink-0">{timeAgo(story.updated_at)}</span>

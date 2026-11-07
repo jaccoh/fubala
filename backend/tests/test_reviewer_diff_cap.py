@@ -130,13 +130,16 @@ def test_concurrent_diffs_never_see_each_others_scratch_index(tmp_path):
         ), name
 
 
-def test_code_reviewer_chunks_diff_and_verdict_references_final_chunk(tmp_path, monkeypatch):
-    """AC2 & AC3: When diff exceeds chunk cap, reviewer reviews in chunks,
-    aggregates review, and final verdict references content from the FINAL chunk."""
+def test_code_reviewer_prompt_caps_the_diff_and_lists_the_files_it_cut(
+    tmp_path, monkeypatch, legacy_review
+):
+    """AC2 & AC3: a diff over the cap is shown capped in the ONE review prompt,
+    the files the cap cut are listed for the reviewer to read from the
+    worktree, and the verdict can reference content from such a file."""
     repo = init_repo(tmp_path)
     monkeypatch.setenv("FUBALA_DATABASE_PATH", str(tmp_path / "diff_cap.db"))
 
-    # Set chunk size to 2,000 chars for this test so a ~2,100 char diff splits into 2 chunks
+    # cap the prompt's diff at 2,000 chars so part2.py falls outside it
     monkeypatch.setattr("app.runner.DIFF_CHUNK_SIZE", 2000)
 
     marker_final = "MARKER_VERIFIED_IN_FINAL_CHUNK_77831"
@@ -181,16 +184,14 @@ def test_code_reviewer_chunks_diff_and_verdict_references_final_chunk(tmp_path, 
                 )
             elif self.calls == 5:  # coder finishes
                 yield D(text="Implemented part1 and part2.")
-            elif self.calls == 6:  # code review - chunk 1 of 2
-                assert "Chunk 1/2" in user_msg or "Chunk 1 of 2" in user_msg
-                assert marker_final not in user_msg
-                yield D(text="Chunk 1 (part1.py) reviewed: syntax clean, no bugs.")
-            elif self.calls == 7:  # code review - chunk 2 of 2 (FINAL CHUNK)
-                assert "FINAL CHUNK" in user_msg
-                assert marker_final in user_msg
+            elif self.calls == 6:  # code review: one prompt, capped diff
+                assert user_msg.startswith("=== CODE REVIEW REQUEST")
+                assert "part1.py" in user_msg and marker_final not in user_msg
+                assert "## Changed files not shown above" in user_msg
+                assert "- part2.py" in user_msg
                 yield D(
                     text=(
-                        f"Chunk 2 reviewed: found expected marker '{marker_final}' in part2.py. "
+                        f"Read part2.py from the worktree: found expected marker '{marker_final}'. "
                         "All checks pass.\n\nVERDICT: APPROVED"
                     )
                 )
@@ -235,7 +236,5 @@ def test_code_reviewer_chunks_diff_and_verdict_references_final_chunk(tmp_path, 
         assert detail["ai_verdict"] == "approved"
         assert detail["ai_review"] is not None
 
-        # AC3 check: the review verdict explicitly references content from the final chunk
+        # AC3 check: the verdict references content from the file the cap cut
         assert marker_final in detail["ai_review"]
-        assert "Chunk 1" in detail["ai_review"]
-        assert "Chunk 2" in detail["ai_review"]

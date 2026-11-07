@@ -2482,7 +2482,9 @@ def test_land_green_unmerged_re_lands_after_the_dwell(tmp_path, monkeypatch):
     """Green suite, open PR, dwell elapsed: exactly one POST
     …/update?style=merge, the note says attempt 1/3, the story stays
     landing (incident run 3053 / PR 70, parked 7h)."""
-    _fast_land_polls(monkeypatch)
+    from app import runner as runner_module
+
+    _fast_land_polls(monkeypatch, dwell=3600)
     server = _fake_gitea(
         pulls={7: {"merged": False, "mergeable": True, "state": "open"}},
         pull_heads={7: "aaa"},
@@ -2492,13 +2494,23 @@ def test_land_green_unmerged_re_lands_after_the_dwell(tmp_path, monkeypatch):
         with _start_race_story(
             tmp_path, monkeypatch, server, "green-unmerged.db"
         ) as (client, sid, approved):
+            # HARD-off the scheduler and join any sweep thread, then drive
+            # the land sweeps by hand: no clock, no race with the note commit.
+            runner = client.app.state.story_runner
+            client.portal.call(runner.stop)
+            runner._gitea_pool.shutdown(wait=True)
+
             server.statuses["aaa"] = _green_statuses()
 
-            deadline = time.time() + 20.0
-            while time.time() < deadline:
-                if _update_calls(server):
-                    break
-                time.sleep(0.05)
+            runner._poll_landing_sync()  # sweep 1: starts the dwell clock
+            assert _update_calls(server) == [], server.requests
+            runner._poll_landing_sync()  # sweep 2: the dwell holds
+            assert _update_calls(server) == [], server.requests
+
+            monkeypatch.setattr(
+                runner_module, "LAND_GREEN_UNMERGED_MIN_DWELL", 0.0
+            )
+            runner._poll_landing_sync()  # sweep 3: dwell elapsed, re-land
             updates = _update_calls(server)
             assert len(updates) == 1, server.requests
             assert (

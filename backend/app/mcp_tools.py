@@ -1413,7 +1413,10 @@ async def patch_settings(values: dict, by: str, raw: bool = False) -> str:
     """Change runtime settings. `values` is the PATCH body (e.g.
     {"model_slots": 2, "test_slots": 1}: at most model_slots LLM calls and
     test_slots verify runs at once; max_parallel_stories is a deprecated alias
-    of model_slots); an explicit null resets a key to its default. Requires
+    of model_slots; worker_fallback_parallel is the max coder runs on the backend
+    node at once when the dev node is full, default 2, 0 = never: stories wait
+    for the dev node, only valid with run_executor=pod); an explicit null
+    resets a key to its default. Requires
     `by`, the actor asking for it."""
     if refused := _by_refused("patch_settings", by, "settings"):
         return refused

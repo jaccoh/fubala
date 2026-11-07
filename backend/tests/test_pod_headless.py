@@ -33,9 +33,10 @@ from test_headless import (
     on_path,
 )
 from test_pod_executor import SETTINGS, FakeKube
+from test_pod_spec import parse_frame
 
+from app import code_graph, pods, procs, workspaces
 from app import headless as hx
-from app import pods, procs, workspaces
 
 STORY = "abc123"
 
@@ -296,6 +297,37 @@ def test_artefact_guard_applies_to_the_pod_commit(tmp_path):
     assert any(a[:3] == ["git", "-C", pods.REPO_DIR] for a, _ in kube.execs)
 
 
+def test_resume_exec_reuses_the_first_config_dir_and_passes_resume(tmp_path):
+    root, wt = story_worktree(tmp_path)
+    capture = tmp_path / "capture.txt"
+    bindir = install_fake_claude(
+        tmp_path, "runtests", env={"FAKE_CLAUDE_CAPTURE": str(capture)}
+    )
+    kube = LocalPodKube(tmp_path / "pod", bindir)
+    ex = make_executor(kube)
+    first = run(ex, root, wt, make_config())
+    assert first.outcome == "run_tests", first.reason
+    assert first.session_id == "sess-fake-1" and first.config_dir
+    second = ex.run_headless(
+        "=== TEST RESULT ===",
+        make_config(),
+        None,
+        workspace=wt,
+        project_root=root,
+        commit_message=f"story {STORY}: coder output",
+        resume=(first.session_id, first.config_dir),
+    )
+    assert second.outcome == "ok", second.reason
+    execs = [s for a, s in kube.execs if kind_of(a) == "headless"]
+    assert len(execs) == 2
+    cfg = f"CLAUDE_CONFIG_DIR {len(first.config_dir.encode())}\n{first.config_dir}".encode()
+    assert cfg in execs[0] and cfg in execs[1]
+    assert b"--resume" not in execs[0]
+    assert b"--resume" in execs[1] and b"sess-fake-1" in execs[1]
+    assert b"BASH_MAX_TIMEOUT_MS 6\n120000" in execs[1]
+    assert "--resume\nsess-fake-1" in capture.read_text()
+
+
 # ---- timeout, cancel, failures ------------------------------------------------------
 
 
@@ -437,6 +469,48 @@ def test_runner_runs_the_cli_in_the_pod(tmp_path, monkeypatch, gateway):
         assert "feature.py" in git(wt, "ls-files")
         assert _events(client, sid, "headless_stream")
         _no_key_anywhere(client, sid)
+    finally:
+        client.__exit__(None, None, None)
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_runner_pod_round_carries_the_graph_only_when_the_setting_is_on(
+    tmp_path, monkeypatch, gateway, graph
+):
+    """Off: no --mcp-config and no graph-build wrapper in the coder exec argv.
+    On (positive control): both."""
+    kube = LocalPodKube(tmp_path / "pod", tmp_path / "bin-ok-0")
+    client = _pod_client(tmp_path, monkeypatch, gateway, "pod", lambda: kube)
+    # the review's impact report runs locally: no real code-review-graph binary
+    monkeypatch.setattr(code_graph, "build", lambda wt, out: None)
+    try:
+        model = _seed_provider(client)
+        proj = client.post(
+            "/api/v1/projects",
+            json={
+                "name": "demo", "root": _init_repo(tmp_path / "repo-dir"),
+                "code_graph_enabled": graph,
+            },
+        ).json()
+        story = client.post(
+            "/api/v1/stories",
+            json={
+                "title": "In pod", "project_id": proj["id"],
+                "execution": "headless", "model": model,
+            },
+        ).json()
+        client.post(f"/api/v1/stories/{story['id']}/queue")
+        _wait_for_status(client, story["id"], "human_review", 60)
+        client.post(f"/api/v1/stories/{story['id']}/approve", json={"by": "t"})
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline and "headless" not in kube.order:
+            time.sleep(0.1)
+        assert "headless" in kube.order
+        frames = [s for a, s in kube.execs if kind_of(a) == "headless"]
+        _env, argv = parse_frame(frames[0])
+        assert "claude" in " ".join(argv)
+        assert ("--mcp-config" in argv) is graph
+        assert (argv[:2] == ["sh", "-c"] and "CRG_DATA_DIR" in argv[2]) is graph
     finally:
         client.__exit__(None, None, None)
 

@@ -1,4 +1,4 @@
-import type { StoryStatus } from "@/types";
+import type { AiVerdict, StoryStatus } from "@/types";
 
 /**
  * Board column model — extracted from BoardView so the status → column
@@ -60,4 +60,29 @@ export function belongsToColumn(
   status: StoryStatus,
 ): boolean {
   return story.status === status;
+}
+
+export interface VerdictBadge {
+  label: string;
+  tone: string;
+}
+
+const VERDICT_BADGES: Record<AiVerdict, VerdictBadge> = {
+  approved: { label: "✓ approved", tone: "bg-emerald-950/80 text-emerald-300" },
+  rejected: { label: "✗ rejected", tone: "bg-red-950/80 text-red-300" },
+  incomplete: { label: "⚠ incomplete", tone: "bg-amber-950/80 text-amber-300" },
+};
+
+/** Badge for the story detail and outcome panels; null without a known verdict. */
+export function verdictBadge(verdict: string | null | undefined): VerdictBadge | null {
+  return verdict && verdict in VERDICT_BADGES ? VERDICT_BADGES[verdict as AiVerdict] : null;
+}
+
+/** Board card chip: only the verdicts that need a human look (not approved). */
+export function cardVerdictChip(verdict: string | null | undefined): VerdictBadge | null {
+  if (verdict === "rejected") return { label: "AI rejected", tone: VERDICT_BADGES.rejected.tone };
+  if (verdict === "incomplete") {
+    return { label: "AI incomplete", tone: VERDICT_BADGES.incomplete.tone };
+  }
+  return null;
 }
